@@ -5,670 +5,529 @@ from datetime import datetime
 
 import streamlit as st
 from openai import OpenAI
+from supabase import create_client
+from PyPDF2 import PdfReader
 
+from docx import Document
+
+# ---------------------------------------------------------
+# Streamlit setup
+# ---------------------------------------------------------
 st.set_page_config(page_title="VA ClaimMate MVP", layout="wide")
 
-client = OpenAI()
+# ---------------------------------------------------------
+# OpenAI client
+# ---------------------------------------------------------
+OPENAI_API_KEY = st.secrets.get("OPENAI_API_KEY", "")
+client = OpenAI(api_key=OPENAI_API_KEY)
 
-DATA_FILE = "claimmate_data.json"
+# ---------------------------------------------------------
+# Supabase client (new official SDK)
+# ---------------------------------------------------------
+SUPABASE_URL = st.secrets.get("SUPABASE_URL", "")
+SUPABASE_KEY = st.secrets.get("SUPABASE_KEY", "")
+
+if not SUPABASE_URL or not SUPABASE_KEY:
+    st.error("Supabase configuration missing in Streamlit secrets.")
+    st.stop()
+
+supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
+
+STATE_TABLE = "claimmate_state"
 
 
-def load_app_data():
-    if os.path.exists(DATA_FILE):
-        try:
-            with open(DATA_FILE, "r", encoding="utf-8") as f:
-                data = json.load(f)
-        except Exception:
-            data = {}
-    else:
-        data = {}
-
-    defaults = {
+# ---------------------------------------------------------
+# Default state for new users
+# ---------------------------------------------------------
+def default_state():
+    return {
         "veteran_profile": {},
         "issues": [],
-        "symptom_mappings": [],
         "symptom_note": "",
-        "claims": [],
-        "notes": "",
+        "symptom_mappings": [],
         "documents": [],
         "evidence_summary": "",
+        "claims": [],
+        "notes": "",
     }
-    for k, v in defaults.items():
-        if k not in data:
-            data[k] = v
-    return data
 
 
-def save_app_data(data):
+# ---------------------------------------------------------
+# Supabase authentication
+# ---------------------------------------------------------
+def sign_up(email, password):
     try:
-        with open(DATA_FILE, "w", encoding="utf-8") as f:
-            json.dump(data, f, indent=2)
+        return supabase.auth.sign_up({"email": email, "password": password})
     except Exception as e:
-        st.error(f"Save error: {e}")
+        st.error(f"Error: {e}")
+        return None
+
+
+def sign_in(email, password):
+    try:
+        return supabase.auth.sign_in_with_password({"email": email, "password": password})
+    except Exception as e:
+        st.error(f"Error: {e}")
+        return None
+
+
+def logout():
+    try:
+        supabase.auth.sign_out()
+    except:
+        pass
+    st.session_state.clear()
+    st.experimental_rerun()
+
+
+def current_user():
+    return st.session_state.get("user")
+
+
+# ---------------------------------------------------------
+# Load and save per-user JSON state
+# ---------------------------------------------------------
+def load_state(user_id):
+    try:
+        res = supabase.table(STATE_TABLE).select("state").eq("user_id", user_id).execute()
+        rows = res.data
+
+        if rows:
+            state = rows[0]["state"]
+        else:
+            state = default_state()
+            supabase.table(STATE_TABLE).insert({"user_id": user_id, "state": state}).execute()
+
+        base = default_state()
+        for key in base:
+            if key not in state:
+                state[key] = base[key]
+
+        return state
+
+    except Exception as e:
+        st.error(f"Error loading user data: {e}")
+        return default_state()
+
+
+def save_state(user_id, state):
+    try:
+        supabase.table(STATE_TABLE).upsert(
+            {"user_id": user_id, "state": state},
+            on_conflict="user_id",
+        ).execute()
+    except Exception as e:
+        st.error(f"Error saving data: {e}")
 
 
 def get_state():
-    if "app_data" not in st.session_state:
-        st.session_state.app_data = load_app_data()
-    return st.session_state.app_data
+    user = current_user()
+    if not user:
+        return None
+
+    if "app_state" not in st.session_state:
+        st.session_state.app_state = load_state(user["id"])
+
+    return st.session_state.app_state
 
 
 def persist_state():
-    if "app_data" in st.session_state:
-        save_app_data(st.session_state.app_data)
+    user = current_user()
+    if user and "app_state" in st.session_state:
+        save_state(user["id"], st.session_state.app_state)
 
 
-def call_gpt(system_prompt, user_prompt, model="gpt-4o-mini", temperature=0.3):
+# ---------------------------------------------------------
+# File extraction
+# ---------------------------------------------------------
+def extract_text(content, mime, name):
+    text = ""
+
+    if mime == "application/pdf":
+        try:
+            reader = PdfReader(io.BytesIO(content))
+            pages = []
+            for page in reader.pages:
+                pages.append(page.extract_text() or "")
+            return "\n".join(pages)
+        except:
+            return ""
+
+    if mime == "application/vnd.openxmlformats-officedocument.wordprocessingml.document":
+        try:
+            doc = Document(io.BytesIO(content))
+            return "\n".join(p.text for p in doc.paragraphs)
+        except:
+            return ""
+
     try:
-        resp = client.chat.completions.create(
+        return content.decode("utf-8", errors="ignore")
+    except:
+        return ""
+
+
+# ---------------------------------------------------------
+# GPT helper
+# ---------------------------------------------------------
+def ask_gpt(system_prompt, user_prompt, model="gpt-4o-mini", temp=0.25):
+    try:
+        result = client.chat.completions.create(
             model=model,
-            temperature=temperature,
+            temperature=temp,
             messages=[
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_prompt},
             ],
         )
-        return resp.choices[0].message.content.strip()
+        return result.choices[0].message.content
     except Exception as e:
         st.error(f"Model error: {e}")
         return ""
 
 
-def extract_text_from_bytes(content: bytes, mime: str, name: str) -> str:
-    text = ""
-    mime = mime or ""
-
-    if mime.startswith("text/"):
-        try:
-            text = content.decode("utf-8", errors="ignore")
-        except Exception:
-            text = ""
-    elif mime == "application/pdf":
-        try:
-            from PyPDF2 import PdfReader
-
-            reader = PdfReader(io.BytesIO(content))
-            pages = []
-            for page in reader.pages:
-                pages.append(page.extract_text() or "")
-            text = "\n".join(pages)
-        except Exception as e:
-            st.warning(f"PDF reading failed for {name}: {e}")
-            text = ""
-    elif mime == "application/vnd.openxmlformats-officedocument.wordprocessingml.document":
-        try:
-            from docx import Document
-
-            document = Document(io.BytesIO(content))
-            paras = [p.text for p in document.paragraphs]
-            text = "\n".join(paras)
-        except Exception as e:
-            st.warning(f"DOCX reading failed for {name}: {e}")
-            text = ""
-    else:
-        try:
-            text = content.decode("utf-8", errors="ignore")
-        except Exception:
-            text = ""
-
-    return text
-
-
-def map_symptoms(symptom_text: str):
+# ---------------------------------------------------------
+# Symptom mapper
+# ---------------------------------------------------------
+def map_symptoms(text):
     system_prompt = (
         "You support veterans building VA disability claims. "
-        'Return JSON only. Format: '
-        '[{"condition":"","icd10":"","body_system":"","va_rating_hint":"","rationale":""}] '
-        "Do not add commentary outside JSON."
+        "Return JSON only. Format: "
+        '[{"condition":"","icd10":"","body_system":"","va_rating_hint":"","rationale":""}]'
     )
 
     user_prompt = (
-        "Symptoms and history from the veteran:\n"
-        f"{symptom_text}\n\n"
-        "Suggest likely diagnostic labels with ICD-10 codes and VA rating hints. "
-        "Include Gulf War environmental exposure links when that fits."
+        "Symptoms from the veteran:\n"
+        f"{text}\n\n"
+        "Suggest diagnostic labels with ICD-10 codes, rating hints, and rationale."
     )
 
-    raw = call_gpt(system_prompt, user_prompt, temperature=0.2)
-    parsed = []
+    raw = ask_gpt(system_prompt, user_prompt)
+
     try:
-        data = json.loads(raw)
-        if isinstance(data, list):
-            parsed = data
-    except Exception:
-        parsed = []
-
-    return parsed, raw
+        parsed = json.loads(raw)
+        return parsed, raw
+    except:
+        return [], raw
 
 
-def build_personal_statement(app_data, claim_title: str, focus_conditions):
-    prof = app_data.get("veteran_profile", {})
-    issues = app_data.get("issues", [])
-    symptom_mappings = app_data.get("symptom_mappings", [])
-    evidence_summary = app_data.get("evidence_summary", "")
+# ---------------------------------------------------------
+# Build personal statement
+# ---------------------------------------------------------
+def build_statement(state, title, focus_conditions):
+    prof = state.get("veteran_profile", {})
+    issues = state.get("issues", [])
+    mappings = state.get("symptom_mappings", [])
+    summary = state.get("evidence_summary", "")
 
-    prof_lines = []
-    if prof.get("full_name"):
-        prof_lines.append(f"Name: {prof.get('full_name')}")
-    if prof.get("branch"):
-        prof_lines.append(f"Branch: {prof.get('branch')}")
-    if prof.get("service_dates"):
-        prof_lines.append(f"Service dates: {prof.get('service_dates')}")
-    if prof.get("deployment_locations"):
-        prof_lines.append(f"Deployments: {prof.get('deployment_locations')}")
-    if prof.get("mos_duties"):
-        prof_lines.append(f"Duties: {prof.get('mos_duties')}")
-    if prof.get("other_notes"):
-        prof_lines.append(f"Other context: {prof.get('other_notes')}")
+    selected = [
+        m for m in mappings
+        if m.get("condition") in focus_conditions
+    ]
 
-    prof_block = "\n".join(prof_lines)
-
-    issue_lines = [f"- {i.get('label')}" for i in issues if i.get("label")]
-    issues_block = "\n".join(issue_lines)
-
-    mapping_lines = []
-    for m in symptom_mappings:
-        if focus_conditions and m.get("condition") not in focus_conditions:
-            continue
-        mapping_lines.append(
-            f"- {m.get('condition')} (ICD-10 {m.get('icd10')}, system: {m.get('body_system')}) "
-            f"Hint: {m.get('va_rating_hint')}"
-        )
-    mappings_block = "\n".join(mapping_lines)
-
-    system_prompt = (
-        "You write VA lay statements and personal impact statements for disability claims. "
-        "Use first person from the veteran. "
-        "Tone: plain language, honest, detailed, no legal jargon. "
-        "Target length: 600 to 900 words. "
-        "Cover onset, progression, daily impact, work impact, safety concerns, sleep, mental health, flare patterns, "
-        "and connection to service. "
-        "Reference medical and symptom context when helpful, without quoting records line by line."
+    sys = (
+        "You write VA disability lay statements. "
+        "Use first person, plain language, detailed daily impact, onsets, progression, "
+        "functional loss, and how conditions relate to service. 600 to 900 words."
     )
 
-    user_prompt = (
-        f"Claim focus title:\n{claim_title}\n\n"
-        f"Veteran background:\n{prof_block}\n\n"
-        f"High level claimed issues:\n{issues_block}\n\n"
-        f"Selected conditions and VA rating hints:\n{mappings_block}\n\n"
-        f"Evidence summary prepared from records:\n{evidence_summary}\n\n"
-        "Write a lay statement for this claim. "
-        "Use first person, talk through a typical day, and explain functional impact. "
-        "End with a short paragraph thanking the rater and confirming that the statement is true to the best of the veteran's knowledge."
-    )
+    usr = f"""
+Claim title:
+{title}
 
-    return call_gpt(system_prompt, user_prompt, temperature=0.35)
+Profile:
+{json.dumps(prof, indent=2)}
 
+Issues:
+{json.dumps(issues, indent=2)}
 
-def build_full_claim_packet(app_data):
-    prof = app_data.get("veteran_profile", {})
-    issues = app_data.get("issues", [])
-    symptom_mappings = app_data.get("symptom_mappings", [])
-    claims = app_data.get("claims", [])
-    evidence_summary = app_data.get("evidence_summary", "")
+Conditions:
+{json.dumps(selected, indent=2)}
 
-    lines = []
+Evidence summary:
+{summary}
 
-    lines.append("VA ClaimMate Claim Packet")
-    lines.append(f"Generated: {datetime.utcnow().isoformat()}Z")
-    lines.append("")
+Write the statement.
+"""
 
-    lines.append("Veteran profile")
-    lines.append("----------------")
-    if prof.get("full_name"):
-        lines.append(f"Name: {prof.get('full_name')}")
-    if prof.get("branch"):
-        lines.append(f"Branch: {prof.get('branch')}")
-    if prof.get("service_dates"):
-        lines.append(f"Service dates: {prof.get('service_dates')}")
-    if prof.get("deployment_locations"):
-        lines.append(f"Deployments: {prof.get('deployment_locations')}")
-    if prof.get("mos_duties"):
-        lines.append(f"Duties / MOS: {prof.get('mos_duties')}")
-    if prof.get("other_notes"):
-        lines.append(f"Additional notes: {prof.get('other_notes')}")
-    lines.append("")
-
-    lines.append("Claimed issues")
-    lines.append("-------------")
-    for i in issues:
-        if i.get("label"):
-            detail = i.get("details") or ""
-            lines.append(f"- {i.get('label')} {(' - ' + detail) if detail else ''}")
-    lines.append("")
-
-    lines.append("Symptom to condition mappings")
-    lines.append("-----------------------------")
-    for m in symptom_mappings:
-        lines.append(
-            f"- {m.get('condition')} | ICD-10 {m.get('icd10')} | system: {m.get('body_system')} "
-            f"| rating hint: {m.get('va_rating_hint')} "
-            f"| selected: {m.get('selected_for_claim', False)}"
-        )
-    lines.append("")
-
-    lines.append("Evidence summary")
-    lines.append("----------------")
-    lines.append(evidence_summary or "[No summary prepared yet]")
-    lines.append("")
-
-    lines.append("Saved personal statements")
-    lines.append("-------------------------")
-    for c in claims:
-        lines.append("")
-        lines.append(f"Title: {c.get('title')}")
-        lines.append(f"Created: {c.get('created_at')}")
-        lines.append("")
-        lines.append(c.get("body") or "")
-        lines.append("")
-
-    return "\n".join(lines)
+    return ask_gpt(sys, usr, temp=0.35)
 
 
-def build_chat_context(app_data):
-    prof = app_data.get("veteran_profile", {})
-    issues = app_data.get("issues", [])
-    evidence_summary = app_data.get("evidence_summary", "")
-    docs = app_data.get("documents", [])
+# ---------------------------------------------------------
+# Chat context builder
+# ---------------------------------------------------------
+def chat_context(state):
+    prof = state.get("veteran_profile", {})
+    issues = state.get("issues", [])
+    summary = state.get("evidence_summary", "")
+    docs = state.get("documents", [])
 
-    prof_bits = []
-    if prof.get("branch"):
-        prof_bits.append(f"Branch: {prof.get('branch')}")
-    if prof.get("service_dates"):
-        prof_bits.append(f"Service dates: {prof.get('service_dates')}")
-    if prof.get("deployment_locations"):
-        prof_bits.append(f"Deployments: {prof.get('deployment_locations')}")
-
-    issues_bits = [i.get("label") for i in issues if i.get("label")]
-
-    doc_snippets = []
+    snippets = []
     for d in docs:
-        text = d.get("text") or ""
-        if text:
-            snippet = text[:1200]
-            doc_snippets.append(f"{d.get('name')}:\n{snippet}")
+        t = d.get("text") or ""
+        if t:
+            snippets.append(f"{d['name']}:\n{t[:800]}")
 
-    pieces = []
-    if prof_bits:
-        pieces.append("Profile:\n" + "\n".join(prof_bits))
-    if issues_bits:
-        pieces.append("Claimed issues:\n- " + "\n- ".join(issues_bits))
-    if evidence_summary:
-        pieces.append("Evidence summary:\n" + evidence_summary)
-    if doc_snippets:
-        pieces.append("Record snippets:\n" + "\n\n".join(doc_snippets[:3]))
+    out = []
 
-    return "\n\n".join(pieces)
+    if prof:
+        out.append("Profile:\n" + json.dumps(prof, indent=2))
+    if issues:
+        out.append("Issues:\n" + json.dumps(issues, indent=2))
+    if summary:
+        out.append("Evidence summary:\n" + summary)
+    if snippets:
+        out.append("Record snippets:\n" + "\n\n".join(snippets))
+
+    return "\n\n".join(out)
 
 
-def main():
-    app_data = get_state()
+# ---------------------------------------------------------
+# Login / Signup screen
+# ---------------------------------------------------------
+def auth_screen():
+    st.title("VA ClaimMate MVP")
+    st.write("Sign up or log in with your email and password.")
+
+    mode = st.radio("Select mode", ["Log in", "Sign up"], horizontal=True)
+
+    email = st.text_input("Email")
+    password = st.text_input("Password", type="password")
+
+    if mode == "Log in":
+        if st.button("Log in"):
+            res = sign_in(email, password)
+            if res and res.user:
+                st.session_state.user = {"id": res.user.id, "email": email}
+                st.experimental_rerun()
+
+    else:
+        if st.button("Sign up"):
+            res = sign_up(email, password)
+            if res and res.user:
+                st.success("Account created. You can now log in.")
+            else:
+                st.error("Sign up failed.")
+
+
+# ---------------------------------------------------------
+# Main app UI
+# ---------------------------------------------------------
+def app_ui():
+    state = get_state()
 
     st.title("VA ClaimMate MVP")
-    st.caption("Step by step helper for stronger VA disability claim preparation.")
 
-    tabs = st.tabs(
-        [
-            "1. Profile & Issues",
-            "2. Upload Evidence",
-            "3. Symptom to Condition Mapper",
-            "4. Personal Statement Builder",
-            "5. Saved Claims Dashboard",
-            "6. General VA Claim Chat",
-        ]
-    )
+    if st.button("Logout"):
+        logout()
 
+    tabs = st.tabs([
+        "Profile",
+        "Upload Evidence",
+        "Symptom Mapper",
+        "Statement Builder",
+        "Saved Claims",
+        "VA Claim Chat"
+    ])
+
+    # -----------------------------------------------------
+    # 1. Profile
+    # -----------------------------------------------------
     with tabs[0]:
-        st.subheader("Step 1. Veteran profile and claimed issues")
-        st.write(
-            "Use this section to store basic service history and a simple list of claim issues. "
-            "Other tabs pull from this data."
-        )
+        st.subheader("Service Profile")
 
-        vp = app_data.get("veteran_profile", {})
+        prof = state["veteran_profile"]
 
-        col1, col2 = st.columns(2)
+        prof["full_name"] = st.text_input("Full name", prof.get("full_name", ""))
+        prof["branch"] = st.text_input("Branch", prof.get("branch", ""))
+        prof["service_dates"] = st.text_input("Service dates", prof.get("service_dates", ""))
+        prof["deployment_locations"] = st.text_area("Deployments", prof.get("deployment_locations", ""))
+        prof["mos_duties"] = st.text_area("Duties / MOS", prof.get("mos_duties", ""))
+        prof["other_notes"] = st.text_area("Other notes", prof.get("other_notes", ""))
 
-        with col1:
-            full_name = st.text_input(
-                "Full name",
-                value=vp.get("full_name", ""),
-            )
-            branch = st.text_input(
-                "Branch of service",
-                value=vp.get("branch", ""),
-            )
-            service_dates = st.text_input(
-                "Service dates (for example: 1989-03 to 1996-01)",
-                value=vp.get("service_dates", ""),
-            )
-            deployment_locations = st.text_area(
-                "Deployments / base locations",
-                value=vp.get("deployment_locations", ""),
-                height=80,
-            )
+        state["veteran_profile"] = prof
 
-        with col2:
-            mos_duties = st.text_area(
-                "Duties, AFSC/MOS, and role details",
-                value=vp.get("mos_duties", ""),
-                height=120,
-            )
-            other_notes = st.text_area(
-                "Other background notes for the rater",
-                value=vp.get("other_notes", ""),
-                height=120,
-            )
+        st.markdown("### Claimed Issues")
+        raw = "\n".join([i["label"] for i in state["issues"]])
+        updated = st.text_area("One issue per line", raw)
 
-        vp["full_name"] = full_name
-        vp["branch"] = branch
-        vp["service_dates"] = service_dates
-        vp["deployment_locations"] = deployment_locations
-        vp["mos_duties"] = mos_duties
-        vp["other_notes"] = other_notes
-        app_data["veteran_profile"] = vp
-
-        st.markdown("---")
-
-        st.markdown("#### Claimed issues list")
-        existing_labels = [i.get("label", "") for i in app_data.get("issues", [])]
-        issues_text = st.text_area(
-            "Enter one issue per line (for example: asthma, cervical spine, PTSD, Gulf War multi-symptom illness)",
-            value="\n".join(existing_labels),
-            height=140,
-        )
-
-        new_issues = []
-        for line in issues_text.splitlines():
+        issues = []
+        for line in updated.splitlines():
             line = line.strip()
             if line:
-                new_issues.append({"label": line, "details": ""})
-        app_data["issues"] = new_issues
+                issues.append({"label": line})
+        state["issues"] = issues
 
+    # -----------------------------------------------------
+    # 2. Upload evidence
+    # -----------------------------------------------------
     with tabs[1]:
-        st.subheader("Step 2. Upload medical records and evidence")
-        st.write(
-            "Upload VA records, C&P exams, DBQs, private records, or STRs. "
-            "The app extracts text for later analysis and summaries."
-        )
+        st.subheader("Upload Evidence")
 
-        uploads = st.file_uploader(
-            "Select one or more files",
-            type=["pdf", "txt", "docx"],
-            accept_multiple_files=True,
-        )
+        uploads = st.file_uploader("Upload files", type=["pdf", "txt", "docx"], accept_multiple_files=True)
 
         if uploads:
-            for up in uploads:
-                content = up.getvalue()
-                mime = up.type
-                name = up.name
+            for file in uploads:
+                content = file.getvalue()
+                mime = file.type
+                name = file.name
                 size = len(content)
 
-                existing_ids = [d.get("id") for d in app_data["documents"]]
                 doc_id = f"{name}:{size}"
-                if doc_id in existing_ids:
+                if doc_id in [d["id"] for d in state["documents"]]:
                     continue
 
-                text = extract_text_from_bytes(content, mime, name)
-                doc_entry = {
+                text = extract_text(content, mime, name)
+
+                state["documents"].append({
                     "id": doc_id,
                     "name": name,
                     "mime": mime,
                     "size": size,
-                    "uploaded_at": datetime.utcnow().isoformat() + "Z",
+                    "uploaded_at": datetime.utcnow().isoformat(),
                     "text": text,
-                    "notes": "",
-                }
-                app_data["documents"].append(doc_entry)
+                })
 
-        if app_data["documents"]:
-            st.markdown("#### Uploaded documents")
-            for idx, doc in enumerate(app_data["documents"]):
-                with st.expander(f"{doc.get('name')} ({doc.get('mime')}, {doc.get('size')} bytes)"):
-                    st.write(f"Uploaded: {doc.get('uploaded_at')}")
-                    doc_notes = st.text_area(
-                        "Notes for this document",
-                        value=doc.get("notes", ""),
-                        key=f"doc_notes_{idx}",
-                    )
-                    doc["notes"] = doc_notes
-                    sample = (doc.get("text") or "")[:1200]
-                    if sample:
-                        st.text_area(
-                            "First part of extracted text",
-                            value=sample,
-                            height=160,
-                            key=f"doc_preview_{idx}",
-                        )
-                    else:
-                        st.info("No text extracted.")
+        for d in state["documents"]:
+            with st.expander(f"{d['name']} ({d['mime']})"):
+                st.text_area("Preview", (d["text"] or "")[:1200], height=200)
 
-        st.markdown("---")
-        st.markdown("#### Combined evidence summary")
+        st.markdown("### Evidence Summary")
 
-        current_summary = app_data.get("evidence_summary", "")
+        current = state.get("evidence_summary", "")
 
-        col_a, col_b = st.columns([1, 1])
-        with col_a:
-            if st.button("Build or refresh evidence summary"):
-                joined_texts = []
-                for d in app_data["documents"]:
-                    text = d.get("text") or ""
-                    if text:
-                        joined_texts.append(f"{d.get('name')}:\n{text}")
-                big_blob = "\n\n".join(joined_texts)
-                big_blob = big_blob[:12000]
+        if st.button("Generate summary"):
+            joined = []
+            for d in state["documents"]:
+                if d.get("text"):
+                    joined.append(d["text"])
+            blob = "\n\n".join(joined)[:15000]
 
-                if big_blob:
-                    system_prompt = (
-                        "You summarize medical records for VA disability claims. "
-                        "Write a structured summary covering diagnoses, key findings, "
-                        "functional limitations, and any references to service or exposures."
-                    )
-                    user_prompt = (
-                        "Summarize the following records for use in a VA claim. "
-                        "Do not give legal advice.\n\n"
-                        f"{big_blob}"
-                    )
-                    summary = call_gpt(system_prompt, user_prompt, temperature=0.25)
-                    app_data["evidence_summary"] = summary
-                    current_summary = summary
-        with col_b:
-            st.caption("Use the button to let the model read uploaded text and draft a combined overview.")
+            if blob:
+                sys = (
+                    "You summarize medical records for VA disability claims. "
+                    "Identify diagnoses, functional impacts, and service connections."
+                )
+                usr = f"Summarize these records:\n{blob}"
+                summary = ask_gpt(sys, usr)
+                state["evidence_summary"] = summary
+                current = summary
 
-        evidence_summary_text = st.text_area(
-            "Evidence summary (editable)",
-            value=current_summary,
-            height=220,
-        )
-        app_data["evidence_summary"] = evidence_summary_text
+        state["evidence_summary"] = st.text_area("Editable summary", current, height=240)
 
+    # -----------------------------------------------------
+    # 3. Symptom mapper
+    # -----------------------------------------------------
     with tabs[2]:
-        st.subheader("Step 3. Symptom to condition mapper")
-        st.write(
-            "Describe symptoms, flare patterns, and service exposures. "
-            "The model proposes diagnostic labels with ICD-10 codes and rating hints."
-        )
+        st.subheader("Symptom Mapper")
 
-        symptom_note = st.text_area(
-            "Describe symptoms and history in your own words",
-            value=app_data.get("symptom_note", ""),
-            height=220,
-        )
-        app_data["symptom_note"] = symptom_note
+        note = st.text_area("Describe symptoms", state.get("symptom_note", ""), height=200)
+        state["symptom_note"] = note
 
-        if st.button("Analyze symptoms and suggest conditions"):
-            if symptom_note.strip():
-                mappings, raw = map_symptoms(symptom_note)
+        if st.button("Analyze symptoms"):
+            if note.strip():
+                mappings, raw = map_symptoms(note)
                 if mappings:
-                    app_data["symptom_mappings"] = mappings
+                    state["symptom_mappings"] = mappings
                 else:
-                    st.warning("No JSON parsed from model response. Raw output shown below.")
-                    st.text_area("Raw model output", value=raw, height=200, key="raw_symptom_output")
+                    st.text(raw)
 
-        if app_data["symptom_mappings"]:
-            st.markdown("#### Suggested conditions")
+        if state["symptom_mappings"]:
+            st.write("Suggested conditions:")
+            st.json(state["symptom_mappings"])
 
-            all_names = [m.get("condition", "") for m in app_data["symptom_mappings"] if m.get("condition")]
-            preselected = [
-                m.get("condition")
-                for m in app_data["symptom_mappings"]
-                if m.get("selected_for_claim") and m.get("condition")
-            ]
-
-            selected = st.multiselect(
-                "Select conditions to link to current claim",
-                all_names,
-                default=preselected,
-            )
-
-            for m in app_data["symptom_mappings"]:
-                m["selected_for_claim"] = m.get("condition") in selected
-
-            rows = []
-            for m in app_data["symptom_mappings"]:
-                rows.append(
-                    {
-                        "Condition": m.get("condition"),
-                        "ICD-10": m.get("icd10"),
-                        "Body system": m.get("body_system"),
-                        "VA rating hint": m.get("va_rating_hint"),
-                        "Selected": m.get("selected_for_claim", False),
-                    }
-                )
-            if rows:
-                st.dataframe(rows, hide_index=True, use_container_width=True)
-
+    # -----------------------------------------------------
+    # 4. Statement Builder
+    # -----------------------------------------------------
     with tabs[3]:
-        st.subheader("Step 4. Personal statement builder")
-        st.write(
-            "Use profile, symptom mapping, and evidence summary to draft lay statements for each claimed issue."
-        )
+        st.subheader("Statement Builder")
 
-        issues = app_data.get("issues", [])
-        symptom_mappings = app_data.get("symptom_mappings", [])
+        mappings = state["symptom_mappings"]
+        conditions = [m["condition"] for m in mappings if m.get("condition")]
 
-        condition_names = [
-            m.get("condition")
-            for m in symptom_mappings
-            if m.get("selected_for_claim") and m.get("condition")
-        ]
+        title_guess = ", ".join(conditions[:3]) if conditions else ""
+        title = st.text_input("Title", title_guess)
 
-        default_title = ""
-        if condition_names:
-            default_title = ", ".join(condition_names[:3])
-        elif issues:
-            default_title = ", ".join(i.get("label") for i in issues[:3] if i.get("label"))
+        focus = st.multiselect("Select conditions for this statement", conditions, default=conditions)
 
-        claim_title = st.text_input(
-            "Title or focus for this statement (for example: Asthma and Gulf War respiratory exposure)",
-            value=default_title,
-        )
+        if st.button("Generate Statement"):
+            if title.strip():
+                text = build_statement(state, title, focus)
+                st.session_state["latest_statement"] = text
 
-        focus_conditions = st.multiselect(
-            "Focus on these conditions in this statement",
-            condition_names,
-            default=condition_names,
-        )
+        current = st.session_state.get("latest_statement", "")
+        edited = st.text_area("Statement", current, height=250)
+        st.session_state["latest_statement"] = edited
 
-        generated_key = "current_generated_statement"
-        if generated_key not in st.session_state:
-            st.session_state[generated_key] = ""
+        if st.button("Save Statement"):
+            if edited.strip():
+                state["claims"].append({
+                    "id": f"claim_{int(datetime.utcnow().timestamp())}",
+                    "title": title,
+                    "body": edited,
+                    "created_at": datetime.utcnow().isoformat(),
+                })
+                st.success("Saved")
 
-        if st.button("Generate personal statement"):
-            if claim_title.strip():
-                text = build_personal_statement(app_data, claim_title, focus_conditions)
-                st.session_state[generated_key] = text
-
-        current_statement = st.text_area(
-            "Personal statement (editable)",
-            value=st.session_state.get(generated_key, ""),
-            height=260,
-        )
-        st.session_state[generated_key] = current_statement
-
-        if st.button("Save statement to claims"):
-            if current_statement.strip():
-                app_data["claims"].append(
-                    {
-                        "id": f"claim_{len(app_data['claims']) + 1}_{int(datetime.utcnow().timestamp())}",
-                        "title": claim_title or "VA claim statement",
-                        "body": current_statement,
-                        "created_at": datetime.utcnow().isoformat() + "Z",
-                    }
-                )
-                st.success("Statement saved to claims dashboard.")
-
+    # -----------------------------------------------------
+    # 5. Saved Claims
+    # -----------------------------------------------------
     with tabs[4]:
-        st.subheader("Step 5. Saved claims dashboard and export")
-        st.write(
-            "Review saved statements and export a combined claim packet for download."
-        )
+        st.subheader("Saved Claims")
 
-        claims = app_data.get("claims", [])
+        for c in state["claims"]:
+            with st.expander(f"{c['title']} - {c['created_at']}"):
+                st.text_area("Text", c["body"], height=200)
 
-        if not claims:
-            st.info("No saved statements yet.")
-        else:
-            remove_ids = []
-            for c in claims:
-                with st.expander(f"{c.get('title')} (created {c.get('created_at')})"):
-                    st.text_area(
-                        "Statement text",
-                        value=c.get("body") or "",
-                        height=220,
-                        key=f"claim_body_{c.get('id')}",
-                    )
-                    if st.button("Remove this statement", key=f"remove_{c.get('id')}"):
-                        remove_ids.append(c.get("id"))
+        all_text = []
 
-            if remove_ids:
-                app_data["claims"] = [c for c in claims if c.get("id") not in remove_ids]
-                st.success("Selected statements removed.")
+        all_text.append("VA ClaimMate Packet\n")
+        all_text.append("Generated " + datetime.utcnow().isoformat() + "\n\n")
 
-        st.markdown("---")
+        all_text.append("Profile:\n" + json.dumps(state["veteran_profile"], indent=2))
+        all_text.append("\nIssues:\n" + json.dumps(state["issues"], indent=2))
+        all_text.append("\nSummary:\n" + state.get("evidence_summary", ""))
 
-        packet_text = build_full_claim_packet(app_data)
+        all_text.append("\n\nStatements:")
+        for c in state["claims"]:
+            all_text.append(f"\n\n---\n{c['title']}\n{c['body']}")
+
+        packet = "\n".join(all_text)
+
         st.download_button(
-            label="Download full claim packet as text (.txt)",
-            data=packet_text,
-            file_name="va_claimmate_packet.txt",
-            mime="text/plain",
+            label="Download full claim packet",
+            data=packet,
+            file_name="claimmate_packet.txt",
+            mime="text/plain"
         )
 
+    # -----------------------------------------------------
+    # 6. Chat
+    # -----------------------------------------------------
     with tabs[5]:
-        st.subheader("General VA claim chat")
-        st.write(
-            "Use this chat for general questions. The assistant uses your profile, issues, evidence summary, and record snippets as context."
-        )
+        st.subheader("General VA Claim Chat")
 
-        if "chat_history" not in st.session_state:
-            st.session_state.chat_history = []
+        if "chat" not in st.session_state:
+            st.session_state.chat = []
 
-        for msg in st.session_state.chat_history:
+        for msg in st.session_state.chat:
             with st.chat_message(msg["role"]):
                 st.write(msg["content"])
 
-        user_msg = st.chat_input("Ask a question about your VA claim or evidence.")
+        user_msg = st.chat_input("Ask a question")
         if user_msg:
-            st.session_state.chat_history.append({"role": "user", "content": user_msg})
+            st.session_state.chat.append({"role": "user", "content": user_msg})
 
-            context = build_chat_context(app_data)
-            system_prompt = (
-                "You are a VA claims helper. "
-                "Provide education on VA concepts, rating criteria, and preparation steps. "
-                "Do not give legal advice and do not promise outcomes. "
-                "Use the provided context when relevant, but you are not a substitute for a VSO, attorney, or accredited representative."
-            )
-            user_prompt = (
-                "Context for this veteran:\n"
-                f"{context}\n\n"
-                f"User question:\n{user_msg}"
-            )
-            reply = call_gpt(system_prompt, user_prompt, temperature=0.35)
+            context = chat_context(state)
 
-            st.session_state.chat_history.append({"role": "assistant", "content": reply})
+            sys = (
+                "You assist veterans with general VA claim guidance. "
+                "No legal advice. Use provided context when helpful."
+            )
+
+            usr = f"Context:\n{context}\n\nQuestion:\n{user_msg}"
+
+            reply = ask_gpt(sys, usr)
+            st.session_state.chat.append({"role": "assistant", "content": reply})
 
             with st.chat_message("assistant"):
                 st.write(reply)
@@ -676,5 +535,16 @@ def main():
     persist_state()
 
 
+# ---------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------
+def main():
+    if not current_user():
+        auth_screen()
+    else:
+        app_ui()
+
+
 if __name__ == "__main__":
     main()
+
