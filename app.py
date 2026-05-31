@@ -5,7 +5,7 @@ from datetime import datetime
 
 import pandas as pd
 import streamlit as st
-from openai import OpenAI
+import google.generativeai as genai
 from supabase import create_client
 from PyPDF2 import PdfReader
 from docx import Document
@@ -21,8 +21,8 @@ from reportlab.platypus import (
 st.set_page_config(page_title="VA ClaimMate", layout="wide")
 
 # ── API clients ────────────────────────────────────────────────────────────
-OPENAI_API_KEY = st.secrets.get("OPENAI_API_KEY", "")
-client = OpenAI(api_key=OPENAI_API_KEY)
+GOOGLE_API_KEY = st.secrets.get("GOOGLE_API_KEY", "")
+genai.configure(api_key=GOOGLE_API_KEY)
 
 SUPABASE_URL = st.secrets.get("SUPABASE_URL", "")
 SUPABASE_KEY = st.secrets.get("SUPABASE_KEY", "")
@@ -297,18 +297,18 @@ def extract_text(content: bytes, mime: str, name: str) -> str:
         return ""
 
 
-# ── GPT helper ─────────────────────────────────────────────────────────────
-def ask_gpt(system_prompt, user_prompt, model="gpt-4o-mini", temp=0.25):
+# ── Gemini helper ──────────────────────────────────────────────────────────
+def ask_ai(system_prompt, user_prompt, model="gemini-2.0-flash", temp=0.25):
     try:
-        resp = client.chat.completions.create(
-            model=model,
-            temperature=temp,
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_prompt},
-            ],
+        m = genai.GenerativeModel(
+            model_name=model,
+            system_instruction=system_prompt,
         )
-        return resp.choices[0].message.content
+        response = m.generate_content(
+            user_prompt,
+            generation_config=genai.GenerationConfig(temperature=temp),
+        )
+        return response.text
     except Exception as e:
         st.error(f"Model error: {e}")
         return ""
@@ -327,7 +327,7 @@ def map_symptoms(text: str):
         "Suggest diagnostic labels with ICD-10 codes, VA rating hints, and rationale. "
         "Include Gulf War or toxic exposure links where relevant."
     )
-    raw = ask_gpt(system_prompt, user_prompt, temp=0.2)
+    raw = ask_ai(system_prompt, user_prompt, temp=0.2)
     try:
         parsed = json.loads(raw)
         if isinstance(parsed, list):
@@ -375,7 +375,7 @@ Evidence summary:
 
 Write a lay statement in first person. End with a short paragraph affirming the statement is true to the best of the veteran's knowledge."""
 
-    return ask_gpt(system_prompt, user_prompt, temp=0.35)
+    return ask_ai(system_prompt, user_prompt, temp=0.35)
 
 
 # ── Buddy statement templates (no API) ─────────────────────────────────────
@@ -1110,7 +1110,7 @@ def tab_evidence(state, tabs):
                             "functional limitations, and any references to service or exposures."
                         )
                         usr = f"Summarize these records for use in a VA disability claim:\n\n{blob}"
-                        current = ask_gpt(sys, usr)
+                        current = ask_ai(sys, usr)
                         state["evidence_summary"] = current
                 else:
                     st.warning("No uploaded documents with extractable text yet.")
@@ -1555,7 +1555,7 @@ def tab_chat(state, tabs):
                 "Suggest consulting a VSO or accredited attorney for specific claim decisions."
             )
             usr = f"Context for this veteran:\n{context}\n\nQuestion:\n{user_msg}"
-            reply = ask_gpt(sys, usr, temp=0.35)
+            reply = ask_ai(sys, usr, temp=0.35)
 
             st.session_state.chat_history.append({"role": "assistant", "content": reply})
             with st.chat_message("assistant"):
