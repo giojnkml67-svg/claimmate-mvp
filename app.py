@@ -44,7 +44,7 @@ PRESUMPTIVE_CONDITIONS = {
             "connection — no nexus letter required."
         ),
         "date_range": ("1962-01-09", "1975-05-07"),
-        "profile_era_match": "Vietnam (1961–1975)",
+        "profile_era_match": ["Vietnam (1961–1975)", "Korea DMZ (1968–1971)"],
         "conditions": [
             {"name": "AL Amyloidosis",                                       "icd10": "E85.0",  "typical_rating": "At least 10%"},
             {"name": "Bladder Cancer",                                        "icd10": "C67.9",  "typical_rating": "100% active; 10% post-tx"},
@@ -203,16 +203,14 @@ def default_state():
 def sign_up(email, password):
     try:
         return supabase.auth.sign_up({"email": email, "password": password})
-    except Exception as e:
-        st.error(f"Sign up error: {e}")
+    except Exception:
         return None
 
 
 def sign_in(email, password):
     try:
         return supabase.auth.sign_in_with_password({"email": email, "password": password})
-    except Exception as e:
-        st.error(f"Sign in error: {e}")
+    except Exception:
         return None
 
 
@@ -234,7 +232,7 @@ def load_state(user_id: str):
     try:
         res = supabase.table(STATE_TABLE).select("state").eq("user_id", user_id).execute()
         rows = res.data or []
-        state = rows[0]["state"] if rows else {}
+        state = (rows[0]["state"] if rows else None) or {}
         if not rows:
             supabase.table(STATE_TABLE).insert({"user_id": user_id, "state": state}).execute()
         base = default_state()
@@ -242,8 +240,8 @@ def load_state(user_id: str):
             if k not in state:
                 state[k] = base[k]
         return state
-    except Exception as e:
-        st.error(f"Error loading data: {e}")
+    except Exception:
+        st.error("Error loading your data. Please refresh the page.")
         return default_state()
 
 
@@ -257,8 +255,8 @@ def save_state(user_id: str, state: dict):
             {"user_id": user_id, "state": state},
             on_conflict="user_id",
         ).execute()
-    except Exception as e:
-        st.error(f"Error saving data: {e}")
+    except Exception:
+        st.error("Error saving your data. Please try again.")
 
 
 def get_state():
@@ -534,11 +532,12 @@ def calculate_va_combined_rating(ratings: list) -> dict:
 
     steps.append(f"Combined (exact): {combined:.2f}%  →  Rounded to nearest 10: {rounded}%")
 
-    if rounded >= 70 and valid[0] >= 40:
+    if (rounded >= 70 and valid[0] >= 40) or valid[0] >= 60:
         steps.append(
             f"With a {rounded}% combined rating and a single rating of {valid[0]}%, "
             "you may qualify for TDIU (Total Disability Individual Unemployability) "
-            "if your conditions prevent substantially gainful employment. "
+            "if your conditions prevent substantially gainful employment "
+            "(38 CFR 4.16a: one disability ≥60%, or combined ≥70% with one ≥40%). "
             "See VA Form 21-8940."
         )
 
@@ -878,11 +877,17 @@ def auth_screen():
         reg_email = st.text_input("Email", key="reg_email")
         reg_pass = st.text_input("Password (8+ characters)", type="password", key="reg_pass")
         if st.button("Sign up"):
-            res = sign_up(reg_email, reg_pass)
-            if res and res.user:
-                st.success("Account created. You can now log in.")
+            if len(reg_pass) < 8:
+                st.error("Password must be at least 8 characters.")
             else:
-                st.error("Sign up failed. The email may already be registered.")
+                res = sign_up(reg_email, reg_pass)
+                if res and res.user:
+                    if res.session:
+                        st.success("Account created. You can now log in.")
+                    else:
+                        st.success("Account created. Check your email to confirm your address, then log in.")
+                else:
+                    st.error("Sign up failed. Please try again.")
 
     st.markdown("---")
     st.caption(
@@ -964,8 +969,13 @@ def tab_presumptive(state, tabs):
 
         prof = state.get("veteran_profile", {})
         eras_served = prof.get("era", [])
+        def _era_matches(group_match, eras):
+            if isinstance(group_match, list):
+                return any(m in eras for m in group_match)
+            return group_match in eras
+
         matched_groups = [key for key, g in PRESUMPTIVE_CONDITIONS.items()
-                          if g["profile_era_match"] in eras_served]
+                          if _era_matches(g["profile_era_match"], eras_served)]
 
         if not eras_served:
             st.info("Add your service era(s) in the Profile tab to see your presumptive matches automatically.")
@@ -978,7 +988,7 @@ def tab_presumptive(state, tabs):
             )
 
         for key, group in PRESUMPTIVE_CONDITIONS.items():
-            era_match = group["profile_era_match"] in eras_served
+            era_match = _era_matches(group["profile_era_match"], eras_served)
             label = ("✓ MATCH — " if era_match else "") + group["era_label"]
 
             with st.expander(label, expanded=era_match):
@@ -1142,7 +1152,7 @@ def tab_symptom_mapper(state, tabs):
         if st.button("Analyze symptoms and suggest conditions"):
             if note.strip():
                 with st.spinner("Analyzing symptoms..."):
-                    mappings, raw = map_symptoms(note)
+                    mappings, raw = map_symptoms(note[:5000])
                 if mappings:
                     state["symptom_mappings"] = mappings
                     st.success(f"Found {len(mappings)} potential condition(s). Select the ones that apply.")
