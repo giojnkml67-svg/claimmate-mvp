@@ -19,6 +19,7 @@ from reportlab.platypus import (
 )
 
 import va_rates
+import cfr_data
 
 st.set_page_config(page_title="VA ClaimMate", layout="wide")
 
@@ -243,6 +244,7 @@ def default_state():
         "buddy_statements": [],
         "rating_inputs": [],
         "va_file_number": "",
+        "secondary_suggestions": "",
     }
 
 
@@ -394,11 +396,11 @@ def compute_readiness(state: dict) -> dict:
         ("Medical evidence added", has_evidence, 15,
          "Upload records or build an evidence summary in Tab 3.", "3. Upload Evidence"),
         ("Personal (lay) statement saved", has_statement, 20,
-         "Generate and save a personal statement in Tab 5 — one of the most important documents.", "5. Statement Builder"),
+         "Generate and save a personal statement in Tab 6 — one of the most important documents.", "6. Statement Builder"),
         ("Supporting / buddy statement saved", has_buddy, 10,
-         "Add a buddy statement in Tab 5 to corroborate your claim.", "5. Statement Builder"),
+         "Add a buddy statement in Tab 6 to corroborate your claim.", "6. Statement Builder"),
         ("Combined rating estimated", has_rating, 5,
-         "Estimate your combined rating and monthly pay in Tab 6.", "6. Rating Calculator"),
+         "Estimate your combined rating and monthly pay in Tab 7.", "7. Rating Calculator"),
     ]
 
     score = sum(w for _, done, w, _, _ in checklist if done)
@@ -460,6 +462,46 @@ def ask_ai(system_prompt, user_prompt, model="gemini-2.0-flash", temp=0.25):
         return ""
 
 
+# ── Secondary-conditions suggester ────────────────────────────────────────
+def suggest_secondary_conditions(primary_conditions: list) -> str:
+    """Ask AI to surface secondary conditions a veteran may be missing.
+
+    Primes the model with known 38 CFR secondary relationships from cfr_data so
+    it starts with accurate anchors before adding AI reasoning.
+    """
+    static_secondaries = []
+    for cond in primary_conditions:
+        data = cfr_data.lookup_condition(cond)
+        if data and data.get("secondary_conditions"):
+            for sc in data["secondary_conditions"]:
+                static_secondaries.append(f"  • {sc} (secondary to {cond})")
+
+    static_block = (
+        "Known 38 CFR secondary relationships:\n" + "\n".join(static_secondaries)
+        if static_secondaries
+        else "No pre-mapped secondary relationships found in the database."
+    )
+
+    system_prompt = (
+        "You are a VA claims education assistant helping veterans identify secondary "
+        "conditions they may not have claimed. For each suggested secondary condition: "
+        "(1) name it with its VA diagnostic code if known, (2) explain the medical link "
+        "to the primary condition in plain language, (3) state what evidence is needed "
+        "(nexus letter, medical records, specific tests), and (4) note any 38 CFR "
+        "citation. Use a clear bulleted format. Only suggest conditions with a genuine, "
+        "recognized medical nexus — do not invent connections."
+    )
+    user_prompt = (
+        f"Veteran's primary service-connected conditions:\n"
+        + "\n".join(f"  • {c}" for c in primary_conditions)
+        + f"\n\n{static_block}\n\n"
+        "List ALL secondary conditions the veteran should consider claiming, "
+        "with medical rationale and required evidence for each. Include any secondary "
+        "conditions from the list above plus others you know to be well-established."
+    )
+    return ask_ai(system_prompt, user_prompt, temp=0.3)
+
+
 # ── Symptom mapper ─────────────────────────────────────────────────────────
 def map_symptoms(text: str):
     system_prompt = (
@@ -497,11 +539,36 @@ def build_statement(state, title, focus_conditions):
         lines = [f"- {m['condition']} ({m['era_label']})" for m in presumptive]
         presumptive_str = "Presumptive conditions:\n" + "\n".join(lines)
 
+    # Build 38 CFR criteria context so the statement addresses the specific
+    # symptom thresholds that determine each rating level.
+    cfr_context = ""
+    if focus_conditions:
+        hits = cfr_data.find_matching_conditions(focus_conditions)
+        if hits:
+            crit_parts = []
+            for _name, data in hits:
+                crit_lines = "\n".join(
+                    f"  {pct}%: {desc}"
+                    for pct, desc in sorted(data["rating_criteria"].items(), reverse=True)
+                )
+                crit_parts.append(
+                    f"{data['full_name']} ({data['cfr_ref']}):\n{crit_lines}"
+                )
+            cfr_context = (
+                "38 CFR rating criteria — address these thresholds in the statement:\n\n"
+                + "\n\n".join(crit_parts)
+            )
+
     system_prompt = (
         "You write VA disability lay statements for veterans. "
         "Use first person, plain language, and detailed daily functional impact. "
         "Cover onset, progression, daily limitations, work impact, sleep, mental health, "
-        "flare patterns, and connection to service. Target 600–900 words."
+        "flare patterns, and connection to service. Target 600–900 words. "
+        "Where 38 CFR rating criteria are provided, ensure the statement explicitly "
+        "addresses the specific symptoms and functional thresholds that determine each "
+        "rating level — for example: frequency and duration of prostrating headaches, "
+        "exact range-of-motion limitations, or occupational and social impairment level. "
+        "Help the statement demonstrate the highest rating the veteran's symptoms support."
     )
     user_prompt = f"""Claim title: {title}
 
@@ -518,6 +585,8 @@ Selected conditions and VA hints:
 
 Evidence summary:
 {summary}
+
+{cfr_context}
 
 Write a lay statement in first person. End with a short paragraph affirming the statement is true to the best of the veteran's knowledge."""
 
@@ -1362,10 +1431,218 @@ def tab_symptom_mapper(state, tabs):
                     st.info("All selected conditions are already in your issues list.")
 
 
-# ── TAB 5: Statement Builder ───────────────────────────────────────────────
-def tab_statement_builder(state, tabs):
+# ── TAB 5: 38 CFR Criteria & C&P Exam Prep ────────────────────────────────
+def tab_cfr_prep(state, tabs):
     with tabs[4]:
-        st.subheader("Step 5 — Statement Builder")
+        st.subheader("Step 5 — 38 CFR Rating Criteria & C&P Exam Prep")
+        st.caption(
+            "See exactly what symptoms earn each rating percentage for your conditions "
+            "(per 38 CFR Part 4), then get personalized C&P exam tips and DBQ forms. "
+            "No AI required for the criteria lookup — the data comes from the federal regulation."
+        )
+
+        # Gather all conditions from the veteran's profile
+        all_conditions = []
+        for i in state.get("issues", []):
+            if i.get("label"):
+                all_conditions.append(i["label"])
+        for m in state.get("presumptive_matches", []):
+            if m.get("condition") and m["condition"] not in all_conditions:
+                all_conditions.append(m["condition"])
+        for m in state.get("symptom_mappings", []):
+            if m.get("selected_for_claim") and m.get("condition") and m["condition"] not in all_conditions:
+                all_conditions.append(m["condition"])
+
+        # ── Part 1: 38 CFR Criteria lookup ────────────────────────────────
+        st.markdown("### 📋 38 CFR Rating Criteria")
+
+        matched = cfr_data.find_matching_conditions(all_conditions) if all_conditions else []
+        unmatched = [
+            c for c in all_conditions
+            if not any(c == m[0] for m in matched)
+        ]
+
+        # Manual search box so veterans can look up ANY condition
+        with st.expander("Search for a condition not in your list", expanded=False):
+            search_query = st.text_input(
+                "Type a condition name (e.g. PTSD, knee, tinnitus, sleep apnea)",
+                key="cfr_search",
+            )
+            if search_query.strip():
+                result = cfr_data.lookup_condition(search_query.strip())
+                if result:
+                    _render_cfr_condition(result, search_query)
+                else:
+                    st.info(
+                        f"No 38 CFR data found for '{search_query}'. "
+                        "The VA Chat tab can help you research criteria for unlisted conditions."
+                    )
+
+        if not all_conditions:
+            st.info(
+                "Add conditions in **Tab 1** (issues list) or **Tab 4** (symptom mapper) "
+                "to see their 38 CFR criteria here automatically."
+            )
+        elif not matched:
+            st.info(
+                "Your conditions aren't in this database yet — use the search box above "
+                "or ask the VA Claims Chat for 38 CFR criteria."
+            )
+            if unmatched:
+                st.caption(f"Conditions not matched: {', '.join(unmatched)}")
+        else:
+            st.success(
+                f"Found 38 CFR criteria for **{len(matched)}** of your "
+                f"{len(all_conditions)} condition(s)."
+            )
+            if unmatched:
+                st.caption(
+                    f"No database match for: {', '.join(unmatched)} — "
+                    "use the search box or VA Chat."
+                )
+
+            for orig_name, data in matched:
+                with st.expander(
+                    f"**{data['full_name']}** — DC {data['diagnostic_code']} | {data['cfr_ref']}",
+                    expanded=True,
+                ):
+                    _render_cfr_condition(data, orig_name)
+
+        # ── Part 2: Secondary Conditions Suggester ─────────────────────────
+        st.markdown("---")
+        st.markdown("### 🔗 Secondary Conditions Suggester")
+        st.caption(
+            "Many veterans leave significant compensation on the table because they don't know "
+            "which secondary conditions they can claim. For example, Diabetes Type 2 → peripheral "
+            "neuropathy, erectile dysfunction, and nephropathy are all separately ratable. "
+            "The AI will surface what you may be missing based on your primary conditions."
+        )
+        st.caption(AI_DISCLAIMER)
+
+        if not all_conditions:
+            st.info("Add your conditions in Tab 1 or Tab 4 first.")
+        else:
+            # Show static secondaries from cfr_data without AI
+            static_shown = False
+            for cond in all_conditions:
+                data = cfr_data.lookup_condition(cond)
+                if data and data.get("secondary_conditions"):
+                    if not static_shown:
+                        st.markdown("**Known secondary conditions from 38 CFR data:**")
+                        static_shown = True
+                    sc_list = "\n".join(f"  - {sc}" for sc in data["secondary_conditions"])
+                    st.markdown(f"**{cond}:**\n{sc_list}")
+
+            if st.button("Ask AI: what secondary conditions am I missing?", type="primary"):
+                with st.spinner("Researching secondary conditions..."):
+                    suggestion = suggest_secondary_conditions(all_conditions)
+                if suggestion:
+                    st.session_state["secondary_suggestions"] = suggestion
+
+            if st.session_state.get("secondary_suggestions"):
+                st.markdown("#### AI-identified secondary conditions")
+                st.markdown(st.session_state["secondary_suggestions"])
+                st.caption(AI_DISCLAIMER)
+
+                if st.button("Add suggested conditions to my issues list — review first"):
+                    st.info(
+                        "Review the suggestions above and manually add the ones that apply "
+                        "to you in **Tab 1 — Profile & Service** (issues list). "
+                        "Each should be confirmed with a VA-accredited VSO and your treating provider."
+                    )
+
+        # ── Part 3: C&P Exam Prep ──────────────────────────────────────────
+        st.markdown("---")
+        st.markdown("### 🏥 C&P Exam Prep & DBQ Finder")
+        st.caption(
+            "A Compensation & Pension (C&P) exam is typically required before VA rates your "
+            "conditions. The examiner completes a Disability Benefits Questionnaire (DBQ) for each "
+            "condition. Being prepared significantly increases the chance of an accurate rating."
+        )
+
+        if not matched:
+            st.info("Add your conditions to see condition-specific C&P tips and DBQ forms.")
+        else:
+            for orig_name, data in matched:
+                with st.expander(f"C&P prep: **{data['full_name']}** ({data['dbq_form']})"):
+                    st.markdown(f"**DBQ Form:** {data['dbq_form']}")
+                    st.markdown("**Exam tips for this condition:**")
+                    for tip in data["cp_tips"]:
+                        st.markdown(f"- {tip}")
+                    st.markdown("**Key evidence to bring / gather before the exam:**")
+                    for ev in data["key_evidence"]:
+                        st.markdown(f"- {ev}")
+
+        st.markdown("---")
+        with st.expander("General C&P exam tips (applies to ALL conditions)"):
+            st.markdown("""
+**Before the exam:**
+- Request all your VA and private medical records in advance and bring a copy
+- Bring a complete, current medication list with dosages
+- Write down your symptoms, frequency, duration, and functional impact — don't rely on memory
+- Ask your VSO to attend or review your file beforehand if possible
+
+**During the exam:**
+- Describe your WORST days, not average or best days — examiners document what you report
+- Don't minimize symptoms or try to appear stronger than you are
+- Report EVERY symptom, even ones that seem minor
+- Describe functional impact: what can't you do, what do you avoid, how does it affect work and relationships?
+- If you have multiple conditions, each will typically have its own exam
+
+**After the exam:**
+- Request a copy of the DBQ the examiner completed
+- If the exam was inadequate (examiner spent fewer than 15 minutes, didn't ask about all symptoms, or seemed rushed), you can request a new exam or submit a buddy statement correcting the record
+- A negative or unfavorable C&P exam is NOT the end — you can rebut it with a private nexus letter
+
+**Your rights:**
+- You can request a private C&P exam (at your own cost) to rebut a VA exam
+- A VSO or accredited claims agent can help you identify inadequate exams
+- You have the right to request a copy of all exam reports
+""")
+
+
+def _render_cfr_condition(data: dict, orig_name: str):
+    """Render the 38 CFR criteria detail block for one condition."""
+    st.markdown(
+        f"**{data['full_name']}** — "
+        f"Diagnostic Code {data['diagnostic_code']} | {data['cfr_ref']}"
+    )
+
+    st.markdown("**Rating Criteria:**")
+    for pct in sorted(data["rating_criteria"].keys(), reverse=True):
+        desc = data["rating_criteria"][pct]
+        color = (
+            "#c8e6c9" if pct >= 70 else
+            "#fff9c4" if pct >= 30 else
+            "#fce4ec" if pct == 0 else
+            "#e3f2fd"
+        )
+        st.markdown(
+            f'<div style="background:{color};padding:6px 10px;border-radius:6px;'
+            f'margin-bottom:4px"><b>{pct}%</b> — {desc}</div>',
+            unsafe_allow_html=True,
+        )
+
+    col_ev, col_tip = st.columns(2)
+    with col_ev:
+        st.markdown("**Key evidence to gather:**")
+        for ev in data["key_evidence"]:
+            st.markdown(f"- {ev}")
+    with col_tip:
+        st.markdown("**C&P exam tips:**")
+        for tip in data["cp_tips"]:
+            st.markdown(f"- {tip}")
+
+    st.caption(
+        f"DBQ Form: {data['dbq_form']}  |  "
+        "Always verify criteria at ecfr.gov/current/title-38/chapter-I/part-4"
+    )
+
+
+# ── TAB 6: Statement Builder ───────────────────────────────────────────────
+def tab_statement_builder(state, tabs):
+    with tabs[5]:
+        st.subheader("Step 6 — Statement Builder")
 
         # Personal statement section
         st.markdown("### Personal Statement (Lay Statement)")
@@ -1495,10 +1772,10 @@ def tab_statement_builder(state, tabs):
                 )
 
 
-# ── TAB 6: Rating Calculator ───────────────────────────────────────────────
+# ── TAB 7: Rating Calculator ───────────────────────────────────────────────
 def tab_rating_calculator(state, tabs):
-    with tabs[5]:
-        st.subheader("Step 6 — VA Combined Rating Calculator")
+    with tabs[6]:
+        st.subheader("Step 7 — VA Combined Rating Calculator")
         st.caption(
             "The VA does NOT add percentages. It uses the 'whole person' method — each disability "
             "is applied to the remaining non-disabled portion. Enter your individual ratings to see "
@@ -1686,10 +1963,10 @@ def tab_rating_calculator(state, tabs):
         )
 
 
-# ── TAB 7: Saved Claims & Export ───────────────────────────────────────────
+# ── TAB 8: Saved Claims & Export ───────────────────────────────────────────
 def tab_saved_claims(state, tabs):
-    with tabs[6]:
-        st.subheader("Step 7 — Saved Claims & Export")
+    with tabs[7]:
+        st.subheader("Step 8 — Saved Claims & Export")
         st.caption(
             "Review your saved statements and export your complete claim packet as a "
             "professionally formatted PDF or plain text file."
@@ -1768,10 +2045,10 @@ def tab_saved_claims(state, tabs):
             )
 
 
-# ── TAB 8: VA Claims Chat ──────────────────────────────────────────────────
+# ── TAB 9: VA Claims Chat ──────────────────────────────────────────────────
 def tab_chat(state, tabs):
-    with tabs[7]:
-        st.subheader("Step 8 — VA Claims Chat")
+    with tabs[8]:
+        st.subheader("Step 9 — VA Claims Chat")
         st.caption(
             "Ask questions about your claim, VA rating criteria, evidence requirements, "
             "or next steps. The assistant uses your profile, conditions, and evidence as context. "
@@ -1838,7 +2115,7 @@ def render_readiness_banner(state: dict):
             else:
                 st.markdown(
                     "**Your packet covers every step.** Review it in "
-                    "**Tab 7 — Saved Claims & Export** and take it to your VSO."
+                    "**Tab 8 — Saved Claims & Export** and take it to your VSO."
                 )
             done = sum(1 for it in r["items"] if it["done"])
             with st.expander(f"Claim strength checklist ({done}/{len(r['items'])} complete)"):
@@ -1850,9 +2127,9 @@ def render_readiness_banner(state: dict):
                         st.markdown(f"{mark} **{it['label']}** — {it['hint']}")
 
 
-# ── TAB 9: Privacy & Data ──────────────────────────────────────────────────
+# ── TAB 10: Privacy & Data ──────────────────────────────────────────────────
 def tab_privacy(state, tabs):
-    with tabs[8]:
+    with tabs[9]:
         st.subheader("🔒 Privacy & Data")
         st.caption("You control your information — review what's stored, export it, or delete it permanently.")
 
@@ -1871,7 +2148,7 @@ def tab_privacy(state, tabs):
 
         st.markdown("#### Export your data")
         st.caption(
-            "Download a full copy anytime from **Tab 7 — Saved Claims & Export** "
+            "Download a full copy anytime from **Tab 8 — Saved Claims & Export** "
             "(PDF or plain text)."
         )
 
@@ -1928,10 +2205,11 @@ def app_ui():
         "2. Presumptive Conditions",
         "3. Upload Evidence",
         "4. Symptom Mapper",
-        "5. Statement Builder",
-        "6. Rating Calculator",
-        "7. Saved Claims & Export",
-        "8. VA Claims Chat",
+        "5. CFR Criteria & C&P Prep",
+        "6. Statement Builder",
+        "7. Rating Calculator",
+        "8. Saved Claims & Export",
+        "9. VA Claims Chat",
         "🔒 Privacy & Data",
     ])
 
@@ -1939,6 +2217,7 @@ def app_ui():
     tab_presumptive(state, tabs)
     tab_evidence(state, tabs)
     tab_symptom_mapper(state, tabs)
+    tab_cfr_prep(state, tabs)
     tab_statement_builder(state, tabs)
     tab_rating_calculator(state, tabs)
     tab_saved_claims(state, tabs)
