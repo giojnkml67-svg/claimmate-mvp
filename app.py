@@ -24,7 +24,9 @@ st.set_page_config(page_title="VA ClaimMate", layout="wide")
 
 # ── API clients ────────────────────────────────────────────────────────────
 GOOGLE_API_KEY = st.secrets.get("GOOGLE_API_KEY", "")
-genai.configure(api_key=GOOGLE_API_KEY)
+AI_ENABLED = bool(GOOGLE_API_KEY)
+if AI_ENABLED:
+    genai.configure(api_key=GOOGLE_API_KEY)
 
 SUPABASE_URL = st.secrets.get("SUPABASE_URL", "")
 SUPABASE_KEY = st.secrets.get("SUPABASE_KEY", "")
@@ -33,8 +35,51 @@ if not SUPABASE_URL or not SUPABASE_KEY:
     st.error("Supabase configuration missing. Set SUPABASE_URL and SUPABASE_KEY in Streamlit secrets.")
     st.stop()
 
+# Anon client, used for sign-up / sign-in (no user session yet).
 supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 STATE_TABLE = "claimmate_state"
+
+# Shown wherever AI output appears, to set expectations honestly.
+AI_DISCLAIMER = (
+    "⚠️ AI-generated and may be incomplete or incorrect. Verify with a "
+    "VA-accredited VSO or attorney and against VA.gov / 38 CFR before relying on it."
+)
+
+
+def authed_client():
+    """Return a Supabase client carrying the signed-in user's JWT.
+
+    Row-Level Security policies key off auth.uid(), so every database call
+    must be made as the authenticated user — not the anonymous key. The
+    client is cached per Streamlit session and refreshed when the access
+    token changes.
+    """
+    sess = st.session_state.get("sb_session")
+    if not sess:
+        return supabase
+
+    cached = st.session_state.get("sb_client")
+    if cached is not None and st.session_state.get("sb_client_token") == sess.get("access_token"):
+        return cached
+
+    client = create_client(SUPABASE_URL, SUPABASE_KEY)
+    try:
+        client.auth.set_session(sess["access_token"], sess["refresh_token"])
+        current = client.auth.get_session()
+        if current:
+            st.session_state["sb_session"] = {
+                "access_token": current.access_token,
+                "refresh_token": current.refresh_token,
+            }
+            st.session_state["sb_client_token"] = current.access_token
+        else:
+            st.session_state["sb_client_token"] = sess.get("access_token")
+    except Exception:
+        # Fall back to whatever token we have; DB calls will surface a
+        # friendly error if the session is no longer valid.
+        st.session_state["sb_client_token"] = sess.get("access_token")
+    st.session_state["sb_client"] = client
+    return client
 
 # ── Presumptive conditions data (no API needed) ────────────────────────────
 PRESUMPTIVE_CONDITIONS = {
@@ -205,22 +250,23 @@ def default_state():
 def sign_up(email, password):
     try:
         return supabase.auth.sign_up({"email": email, "password": password})
-    except Exception as e:
-        st.error(f"Sign up error: {e}")
+    except Exception:
+        st.error("We couldn't create that account. The email may already be registered.")
         return None
 
 
 def sign_in(email, password):
     try:
         return supabase.auth.sign_in_with_password({"email": email, "password": password})
-    except Exception as e:
-        st.error(f"Sign in error: {e}")
+    except Exception:
+        st.error("Login failed. Check your email and password, then try again.")
         return None
 
 
 def logout():
+    client = authed_client()
     try:
-        supabase.auth.sign_out()
+        client.auth.sign_out()
     except Exception:
         pass
     st.session_state.clear()
@@ -231,21 +277,48 @@ def current_user():
     return st.session_state.get("user")
 
 
+def delete_user_data(user_id: str) -> bool:
+    """Permanently delete the veteran's stored claim data (their DB row)."""
+    try:
+        authed_client().table(STATE_TABLE).delete().eq("user_id", user_id).execute()
+        return True
+    except Exception:
+        st.error("We couldn't delete your data right now. Please try again.")
+        return False
+
+
+def delete_account(user_id: str) -> bool:
+    """Delete the entire account (auth record + data) via a secure RPC.
+
+    Requires the delete_my_account() function from schema.sql to be installed.
+    """
+    try:
+        authed_client().rpc("delete_my_account", {}).execute()
+        return True
+    except Exception:
+        st.error(
+            "Account deletion isn't available yet. Your data can still be "
+            "deleted above. (Admins: install delete_my_account() from schema.sql.)"
+        )
+        return False
+
+
 # ── State load/save ────────────────────────────────────────────────────────
 def load_state(user_id: str):
     try:
-        res = supabase.table(STATE_TABLE).select("state").eq("user_id", user_id).execute()
+        client = authed_client()
+        res = client.table(STATE_TABLE).select("state").eq("user_id", user_id).execute()
         rows = res.data or []
         state = rows[0]["state"] if rows else {}
         if not rows:
-            supabase.table(STATE_TABLE).insert({"user_id": user_id, "state": state}).execute()
+            client.table(STATE_TABLE).insert({"user_id": user_id, "state": state}).execute()
         base = default_state()
         for k in base:
             if k not in state:
                 state[k] = base[k]
         return state
-    except Exception as e:
-        st.error(f"Error loading data: {e}")
+    except Exception:
+        st.error("We couldn't load your saved data. Please refresh the page and try again.")
         return default_state()
 
 
@@ -255,12 +328,12 @@ def save_state(user_id: str, state: dict):
         for k in base:
             if k not in state:
                 state[k] = base[k]
-        supabase.table(STATE_TABLE).upsert(
+        authed_client().table(STATE_TABLE).upsert(
             {"user_id": user_id, "state": state},
             on_conflict="user_id",
         ).execute()
-    except Exception as e:
-        st.error(f"Error saving data: {e}")
+    except Exception:
+        st.error("We couldn't save your latest changes. Please check your connection and try again.")
 
 
 def get_state():
@@ -359,19 +432,31 @@ def extract_text(content: bytes, mime: str, name: str) -> str:
 
 
 # ── Gemini helper ──────────────────────────────────────────────────────────
+# Appended to every system prompt as a safety guardrail.
+AI_GUARDRAIL = (
+    " Important: You are an educational aid, not a doctor, lawyer, or the VA. "
+    "Do not fabricate facts, regulations, ICD-10 codes, dollar amounts, deadlines, "
+    "or medical findings. If you are not confident, say so and point the veteran to "
+    "VA.gov, 38 CFR, or a VA-accredited VSO. Never guarantee a claim outcome or rating."
+)
+
+
 def ask_ai(system_prompt, user_prompt, model="gemini-2.0-flash", temp=0.25):
+    if not AI_ENABLED:
+        st.warning("AI features are unavailable — no AI API key is configured for this app.")
+        return ""
     try:
         m = genai.GenerativeModel(
             model_name=model,
-            system_instruction=system_prompt,
+            system_instruction=system_prompt + AI_GUARDRAIL,
         )
         response = m.generate_content(
             user_prompt,
             generation_config=genai.GenerationConfig(temperature=temp),
         )
         return response.text
-    except Exception as e:
-        st.error(f"Model error: {e}")
+    except Exception:
+        st.error("The AI service had a problem. Please wait a moment and try again.")
         return ""
 
 
@@ -928,9 +1013,15 @@ def auth_screen():
         password = st.text_input("Password", type="password", key="login_pass")
         if st.button("Log in", type="primary"):
             res = sign_in(email, password)
-            if res and res.user:
+            if res and res.user and getattr(res, "session", None):
                 st.session_state.user = {"id": res.user.id, "email": email}
+                st.session_state["sb_session"] = {
+                    "access_token": res.session.access_token,
+                    "refresh_token": res.session.refresh_token,
+                }
                 st.rerun()
+            elif res and res.user:
+                st.error("Please confirm your email address, then log in.")
             else:
                 st.error("Login failed. Check your email and password.")
 
@@ -946,6 +1037,18 @@ def auth_screen():
                 st.error("Sign up failed. The email may already be registered.")
 
     st.markdown("---")
+    with st.expander("Your privacy & how your data is protected"):
+        st.markdown(
+            "- Your data is stored privately and protected by database-level "
+            "Row-Level Security — only your account can read it.\n"
+            "- Uploaded files are read for text in memory and are **not** saved.\n"
+            "- AI features send the text you provide to Google Gemini to generate "
+            "suggestions; AI output can be wrong — always verify it.\n"
+            "- You can export or permanently delete your data at any time from the "
+            "**Privacy & Data** tab after you log in.\n\n"
+            "By creating an account you acknowledge this is an educational tool, not "
+            "the VA and not legal advice."
+        )
     st.caption(
         "VA ClaimMate is an AI-assisted claim preparation tool. "
         "It is not affiliated with the U.S. Department of Veterans Affairs and does not provide legal advice. "
@@ -1192,6 +1295,7 @@ def tab_symptom_mapper(state, tabs):
             "Describe your symptoms in your own words. The AI suggests diagnostic labels "
             "with ICD-10 codes and VA rating hints. Select the ones that apply to your claim."
         )
+        st.caption(AI_DISCLAIMER)
 
         note = st.text_area(
             "Describe your symptoms, flare patterns, and any relevant service exposures",
@@ -1270,6 +1374,7 @@ def tab_statement_builder(state, tabs):
             "your conditions and how they affect your daily life. This is one of the most "
             "important documents you can submit with your claim."
         )
+        st.caption(AI_DISCLAIMER)
 
         mappings = state.get("symptom_mappings", [])
         all_conditions = [m.get("condition") for m in mappings if m.get("condition")]
@@ -1673,6 +1778,7 @@ def tab_chat(state, tabs):
             "This is education only — not legal advice. Consult a VSO or accredited attorney "
             "for guidance on your specific claim."
         )
+        st.caption(AI_DISCLAIMER)
 
         if "chat_history" not in st.session_state:
             st.session_state.chat_history = []
@@ -1744,6 +1850,60 @@ def render_readiness_banner(state: dict):
                         st.markdown(f"{mark} **{it['label']}** — {it['hint']}")
 
 
+# ── TAB 9: Privacy & Data ──────────────────────────────────────────────────
+def tab_privacy(state, tabs):
+    with tabs[8]:
+        st.subheader("🔒 Privacy & Data")
+        st.caption("You control your information — review what's stored, export it, or delete it permanently.")
+
+        st.markdown("#### What we store")
+        st.markdown(
+            "- Your account email and service profile\n"
+            "- The conditions you're claiming and your notes\n"
+            "- Text extracted from documents you upload (the files themselves are **not** saved)\n"
+            "- AI-generated drafts and your rating inputs"
+        )
+        st.info(
+            "Your data is protected by database-level Row-Level Security — only your "
+            "account can read or change it. AI features send the text you provide to "
+            "Google Gemini to generate suggestions; AI output can be wrong, so always verify it."
+        )
+
+        st.markdown("#### Export your data")
+        st.caption(
+            "Download a full copy anytime from **Tab 7 — Saved Claims & Export** "
+            "(PDF or plain text)."
+        )
+
+        st.markdown("---")
+        st.markdown("#### ⚠️ Danger zone")
+
+        user = current_user()
+        uid = user["id"] if user else None
+
+        st.markdown("**Delete all my claim data**")
+        st.caption("Permanently removes everything you've entered. This cannot be undone.")
+        confirm_data = st.checkbox(
+            "I understand this permanently deletes my claim data.", key="confirm_del_data"
+        )
+        if st.button("Delete my data", disabled=not confirm_data):
+            if uid and delete_user_data(uid):
+                st.session_state.app_state = default_state()
+                st.success("Your claim data has been deleted.")
+                st.rerun()
+
+        st.markdown("")
+        st.markdown("**Delete my entire account**")
+        st.caption("Removes your login and all data, then signs you out.")
+        confirm_acct = st.checkbox(
+            "I understand this permanently deletes my account.", key="confirm_del_acct"
+        )
+        if st.button("Delete my account", disabled=not confirm_acct):
+            if uid and delete_account(uid):
+                st.success("Your account has been deleted.")
+                logout()
+
+
 # ── MAIN APP UI ────────────────────────────────────────────────────────────
 def app_ui():
     state = get_state()
@@ -1772,6 +1932,7 @@ def app_ui():
         "6. Rating Calculator",
         "7. Saved Claims & Export",
         "8. VA Claims Chat",
+        "🔒 Privacy & Data",
     ])
 
     tab_profile(state, tabs)
@@ -1782,6 +1943,7 @@ def app_ui():
     tab_rating_calculator(state, tabs)
     tab_saved_claims(state, tabs)
     tab_chat(state, tabs)
+    tab_privacy(state, tabs)
 
     persist_state()
 
