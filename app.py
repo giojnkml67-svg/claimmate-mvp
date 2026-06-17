@@ -18,6 +18,8 @@ from reportlab.platypus import (
     PageBreak, HRFlowable,
 )
 
+import va_rates
+
 st.set_page_config(page_title="VA ClaimMate", layout="wide")
 
 # ── API clients ────────────────────────────────────────────────────────────
@@ -274,6 +276,65 @@ def persist_state():
     user = current_user()
     if user and "app_state" in st.session_state:
         save_state(user["id"], st.session_state.app_state)
+
+
+# ── Claim readiness score ──────────────────────────────────────────────────
+def compute_readiness(state: dict) -> dict:
+    """Score how complete the claim packet is and surface the next best step.
+
+    Returns {score, items, next_step} where items is an ordered checklist.
+    """
+    prof = state.get("veteran_profile", {})
+    eras = prof.get("era", []) or []
+
+    profile_ready = bool(
+        prof.get("full_name") and prof.get("branch")
+        and prof.get("service_dates") and eras
+    )
+    has_issues = any(i.get("label") for i in state.get("issues", []))
+    has_evidence = bool(
+        state.get("documents") or (state.get("evidence_summary") or "").strip()
+    )
+    has_statement = bool(state.get("claims"))
+    has_buddy = bool(state.get("buddy_statements"))
+    has_rating = bool(state.get("rating_inputs"))
+
+    # Presumptive item: pending until an era is set; then it's done either
+    # when no presumptive group applies or the veteran has selected matches.
+    matching_groups = [
+        g for g in PRESUMPTIVE_CONDITIONS.values()
+        if g["profile_era_match"] in eras
+    ]
+    if not eras:
+        presumptive_ready = False
+    else:
+        presumptive_ready = (not matching_groups) or bool(state.get("presumptive_matches"))
+
+    # (label, done, weight, hint, tab_hint)
+    checklist = [
+        ("Service profile completed", profile_ready, 20,
+         "Add your name, branch, service dates, and era in Tab 1.", "1. Profile & Service"),
+        ("Conditions you're claiming listed", has_issues, 20,
+         "List the conditions you're claiming in Tab 1.", "1. Profile & Service"),
+        ("Presumptive conditions reviewed", presumptive_ready, 10,
+         "Your service era may match presumptive conditions — review Tab 2.", "2. Presumptive Conditions"),
+        ("Medical evidence added", has_evidence, 15,
+         "Upload records or build an evidence summary in Tab 3.", "3. Upload Evidence"),
+        ("Personal (lay) statement saved", has_statement, 20,
+         "Generate and save a personal statement in Tab 5 — one of the most important documents.", "5. Statement Builder"),
+        ("Supporting / buddy statement saved", has_buddy, 10,
+         "Add a buddy statement in Tab 5 to corroborate your claim.", "5. Statement Builder"),
+        ("Combined rating estimated", has_rating, 5,
+         "Estimate your combined rating and monthly pay in Tab 6.", "6. Rating Calculator"),
+    ]
+
+    score = sum(w for _, done, w, _, _ in checklist if done)
+    items = [
+        {"label": label, "done": done, "hint": hint, "tab": tab}
+        for label, done, _w, hint, tab in checklist
+    ]
+    next_step = next((it for it in items if not it["done"]), None)
+    return {"score": score, "items": items, "next_step": next_step}
 
 
 # ── File extraction ────────────────────────────────────────────────────────
@@ -1390,6 +1451,7 @@ def tab_rating_calculator(state, tabs):
                 st.warning("Enter at least one rating above.")
             else:
                 result = calculate_va_combined_rating(parsed_ratings)
+                st.session_state["last_combined_rating"] = result["display_rating"]
 
                 st.markdown("---")
                 st.markdown("#### Results")
@@ -1444,6 +1506,79 @@ def tab_rating_calculator(state, tabs):
                     "(e.g., both knees, both shoulders), VA adds a 10% bilateral adjustment before "
                     "the combined calculation. Add that adjustment manually to your inputs if applicable.*"
                 )
+
+        # ── Monthly compensation estimator ─────────────────────────────────
+        st.markdown("---")
+        st.markdown("### 💰 Estimated monthly compensation")
+        st.caption(
+            f"Based on official VA rates effective {va_rates.RATES_EFFECTIVE}. "
+            "VA disability pay is tax-free. This is an estimate — your actual "
+            "payment depends on your approved rating and verified dependents."
+        )
+
+        default_rating = st.session_state.get("last_combined_rating", 0)
+        default_idx = va_rates.VALID_RATINGS.index(va_rates.snap_to_rating(default_rating))
+
+        est_col1, est_col2 = st.columns(2)
+        with est_col1:
+            sel_rating = st.selectbox(
+                "Combined rating to estimate",
+                va_rates.VALID_RATINGS,
+                index=default_idx,
+                format_func=lambda r: f"{r}%",
+                help="Defaults to your calculated combined rating above. Change it to compare scenarios.",
+            )
+            has_spouse = st.checkbox("Married / has a spouse")
+            spouse_aa = False
+            if has_spouse:
+                spouse_aa = st.checkbox(
+                    "Spouse needs Aid & Attendance",
+                    help="Check only if your spouse requires daily aid and attendance.",
+                )
+        with est_col2:
+            kids_u18 = st.number_input(
+                "Dependent children under 18", min_value=0, max_value=15, value=0, step=1
+            )
+            kids_school = st.number_input(
+                "Children 18+ in a qualifying school program",
+                min_value=0, max_value=15, value=0, step=1,
+            )
+            n_parents = st.number_input(
+                "Dependent parents", min_value=0, max_value=2, value=0, step=1
+            )
+
+        est = va_rates.estimate_monthly_compensation(
+            sel_rating,
+            spouse=has_spouse,
+            children_under_18=kids_u18,
+            children_in_school=kids_school,
+            dependent_parents=n_parents,
+            spouse_aid_attendance=spouse_aa,
+        )
+
+        m1, m2 = st.columns(2)
+        with m1:
+            st.metric("Estimated monthly payment", f"${est['total']:,.2f}")
+        with m2:
+            st.metric("Estimated per year", f"${est['total'] * 12:,.2f}")
+
+        if est["note"]:
+            st.info(est["note"])
+
+        if len(est["breakdown"]) > 1:
+            with st.expander("See how this is calculated"):
+                for label, amount in est["breakdown"]:
+                    st.write(f"• {label}: ${amount:,.2f}")
+                st.caption(
+                    "Note: the first dependent child under 18 is estimated at the "
+                    "standard per-child amount, so figures with children may be a few "
+                    "dollars conservative."
+                )
+
+        st.caption(
+            f"Rates can change each December (COLA). Verify your exact amount with the "
+            f"official VA calculator: {va_rates.VA_RATES_URL}"
+        )
 
 
 # ── TAB 7: Saved Claims & Export ───────────────────────────────────────────
@@ -1500,19 +1635,23 @@ def tab_saved_claims(state, tabs):
             if st.button("Generate PDF packet", type="primary"):
                 with st.spinner("Building PDF..."):
                     try:
-                        pdf_bytes = generate_pdf_packet(state)
-                        prof = state.get("veteran_profile", {})
-                        name_slug = (prof.get("full_name") or "veteran").replace(" ", "_").lower()
-                        date_slug = datetime.utcnow().strftime("%Y%m%d")
-                        st.download_button(
-                            label="Download PDF claim packet",
-                            data=pdf_bytes,
-                            file_name=f"va_claimmate_{name_slug}_{date_slug}.pdf",
-                            mime="application/pdf",
-                            key="pdf_dl",
-                        )
-                    except Exception as e:
-                        st.error(f"PDF generation failed: {e}")
+                        st.session_state["pdf_packet_bytes"] = generate_pdf_packet(state)
+                    except Exception:
+                        st.session_state.pop("pdf_packet_bytes", None)
+                        st.error("Sorry, the PDF couldn't be generated. Please try again.")
+            # Render the download button unconditionally so it survives reruns.
+            if st.session_state.get("pdf_packet_bytes"):
+                prof = state.get("veteran_profile", {})
+                name_slug = (prof.get("full_name") or "veteran").replace(" ", "_").lower()
+                date_slug = datetime.utcnow().strftime("%Y%m%d")
+                st.download_button(
+                    label="Download PDF claim packet",
+                    data=st.session_state["pdf_packet_bytes"],
+                    file_name=f"va_claimmate_{name_slug}_{date_slug}.pdf",
+                    mime="application/pdf",
+                    key="pdf_dl",
+                )
+                st.caption("PDF ready — click to download.")
 
         with col_txt:
             packet_txt = build_txt_packet(state)
@@ -1567,6 +1706,44 @@ def tab_chat(state, tabs):
                 st.rerun()
 
 
+# ── Claim readiness banner ─────────────────────────────────────────────────
+def render_readiness_banner(state: dict):
+    r = compute_readiness(state)
+    score = r["score"]
+    if score >= 90:
+        tier, emoji = "Claim-ready", "🎖️"
+    elif score >= 70:
+        tier, emoji = "Almost claim-ready", "💪"
+    elif score >= 40:
+        tier, emoji = "Coming along", "📈"
+    else:
+        tier, emoji = "Just getting started", "🚀"
+
+    with st.container(border=True):
+        c1, c2 = st.columns([1, 3])
+        with c1:
+            st.metric("Claim readiness", f"{score}%")
+            st.caption(f"{emoji} {tier}")
+        with c2:
+            st.progress(score / 100)
+            nxt = r["next_step"]
+            if nxt:
+                st.markdown(f"**Next best step:** {nxt['hint']}")
+            else:
+                st.markdown(
+                    "**Your packet covers every step.** Review it in "
+                    "**Tab 7 — Saved Claims & Export** and take it to your VSO."
+                )
+            done = sum(1 for it in r["items"] if it["done"])
+            with st.expander(f"Claim strength checklist ({done}/{len(r['items'])} complete)"):
+                for it in r["items"]:
+                    mark = "✅" if it["done"] else "⬜"
+                    if it["done"]:
+                        st.markdown(f"{mark} **{it['label']}**")
+                    else:
+                        st.markdown(f"{mark} **{it['label']}** — {it['hint']}")
+
+
 # ── MAIN APP UI ────────────────────────────────────────────────────────────
 def app_ui():
     state = get_state()
@@ -1583,6 +1760,8 @@ def app_ui():
             st.caption(f"{user.get('email', '')}")
         if st.button("Logout"):
             logout()
+
+    render_readiness_banner(state)
 
     tabs = st.tabs([
         "1. Profile & Service",
