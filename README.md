@@ -43,11 +43,39 @@ PDF/text export, and an educational Q&A chat.
    streamlit run app.py
    ```
 
+## Deployment (Docker)
+
+The repo ships with a `Dockerfile` and `start.sh` that inject secrets from
+environment variables at startup — the standard pattern for Railway, Render,
+Fly.io, and Cloud Run.
+
+```bash
+# Local test with Docker Compose
+export GOOGLE_API_KEY=... SUPABASE_URL=... SUPABASE_KEY=...
+docker compose up --build
+```
+
+| Platform | One-liner |
+|----------|-----------|
+| **Railway** | New Project → Deploy from GitHub → set env vars → add custom domain |
+| **Render** | New Web Service → Docker → set env vars |
+| **Fly.io** | `fly launch && fly secrets set ... && fly deploy` |
+| **Streamlit Cloud** | share.streamlit.io → add secrets in app settings (free, limited) |
+
+See [`DISTRIBUTION.md`](DISTRIBUTION.md) for the full hosting and growth guide.
+
+## Landing page (GitHub Pages)
+
+The `docs/` folder contains an SEO-optimized landing page. Enable GitHub Pages
+(Settings → Pages → Source: **GitHub Actions**) and it deploys automatically on
+every push to `main`. Update the `YOUR-DOMAIN-HERE` and `YOUR-APP-URL-HERE`
+placeholders in `docs/index.html` before enabling.
+
 ## Tests
 
 ```bash
 pip install -r requirements-dev.txt
-pytest                     # or: python tests/test_va_rates.py
+pytest                     # 27 tests across va_rates and cfr_data modules
 ```
 
 ## Privacy & data
