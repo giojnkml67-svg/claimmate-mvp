@@ -5,7 +5,8 @@ from datetime import datetime
 
 import pandas as pd
 import streamlit as st
-import google.generativeai as genai
+from google import genai
+from google.genai import types as genai_types
 from supabase import create_client
 from PyPDF2 import PdfReader
 from docx import Document
@@ -26,8 +27,7 @@ st.set_page_config(page_title="VA ClaimMate", layout="wide")
 # ── API clients ────────────────────────────────────────────────────────────
 GOOGLE_API_KEY = st.secrets.get("GOOGLE_API_KEY", "")
 AI_ENABLED = bool(GOOGLE_API_KEY)
-if AI_ENABLED:
-    genai.configure(api_key=GOOGLE_API_KEY)
+genai_client = genai.Client(api_key=GOOGLE_API_KEY) if AI_ENABLED else None
 
 SUPABASE_URL = st.secrets.get("SUPABASE_URL", "")
 SUPABASE_KEY = st.secrets.get("SUPABASE_KEY", "")
@@ -444,17 +444,17 @@ AI_GUARDRAIL = (
 
 
 def ask_ai(system_prompt, user_prompt, model="gemini-2.0-flash", temp=0.25):
-    if not AI_ENABLED:
+    if not AI_ENABLED or genai_client is None:
         st.warning("AI features are unavailable — no AI API key is configured for this app.")
         return ""
     try:
-        m = genai.GenerativeModel(
-            model_name=model,
-            system_instruction=system_prompt + AI_GUARDRAIL,
-        )
-        response = m.generate_content(
-            user_prompt,
-            generation_config=genai.GenerationConfig(temperature=temp),
+        response = genai_client.models.generate_content(
+            model=model,
+            config=genai_types.GenerateContentConfig(
+                system_instruction=system_prompt + AI_GUARDRAIL,
+                temperature=temp,
+            ),
+            contents=user_prompt,
         )
         return response.text
     except Exception:
