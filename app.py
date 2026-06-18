@@ -504,6 +504,7 @@ def create_checkout_session(email: str) -> str | None:
             mode="subscription",
             line_items=[{"price": STRIPE_PRICE_ID, "quantity": 1}],
             customer_email=email,
+            allow_promotion_codes=True,
             success_url=APP_URL + "?payment=success&session_id={CHECKOUT_SESSION_ID}",
             cancel_url=APP_URL + "?payment=cancelled",
         )
