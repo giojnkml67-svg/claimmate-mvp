@@ -1458,7 +1458,7 @@ def auth_screen():
           </p>
           <div style="margin-top:1.1rem; display:flex; gap:.5rem; justify-content:center; flex-wrap:wrap;">
             <span style="background:rgba(255,213,79,.18); color:#ffd54f; padding:.32rem .85rem;
-                  border-radius:99px; font-size:.82rem; font-weight:600;">🎖️ Free for all veterans</span>
+                  border-radius:99px; font-size:.82rem; font-weight:600;">🎖️ Free to start</span>
             <span style="background:rgba(255,255,255,.12); color:#fff; padding:.32rem .85rem;
                   border-radius:99px; font-size:.82rem; font-weight:600;">🔒 Private &amp; secure</span>
             <span style="background:rgba(255,255,255,.12); color:#fff; padding:.32rem .85rem;
