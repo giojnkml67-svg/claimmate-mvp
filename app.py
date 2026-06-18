@@ -2468,13 +2468,21 @@ def tab_saved_claims(state, tabs):
                 st.caption("PDF ready — click to download.")
 
         with col_txt:
-            packet_txt = build_txt_packet(state)
-            st.download_button(
-                label="Download as plain text (.txt)",
-                data=packet_txt,
-                file_name="va_claimmate_packet.txt",
-                mime="text/plain",
-            )
+            if is_pro(state):
+                packet_txt = build_txt_packet(state)
+                st.download_button(
+                    label="Download as plain text (.txt)",
+                    data=packet_txt,
+                    file_name="va_claimmate_packet.txt",
+                    mime="text/plain",
+                )
+            else:
+                st.markdown("**🔒 Pro feature** — text export is included with VA ClaimMate Pro.")
+                if STRIPE_ENABLED:
+                    user = current_user()
+                    checkout_url = create_checkout_session(user.get("email", "")) if user else None
+                    if checkout_url:
+                        st.link_button("Upgrade to Pro — $9.99/mo", checkout_url, type="primary")
 
 
 # ── TAB 9: VA Claims Chat ──────────────────────────────────────────────────
