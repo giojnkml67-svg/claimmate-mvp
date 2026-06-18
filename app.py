@@ -5,6 +5,7 @@ from datetime import datetime
 
 import pandas as pd
 import streamlit as st
+import streamlit.components.v1 as st_components
 from google import genai
 from google.genai import types as genai_types
 from supabase import create_client
@@ -1069,6 +1070,73 @@ def generate_pdf_packet(state: dict) -> bytes:
     return buf.getvalue()
 
 
+# ── PASSWORD RESET HELPERS ─────────────────────────────────────────────────
+def _inject_hash_extractor():
+    """Inject JS that converts Supabase's #access_token=...&type=recovery hash
+    fragment into ?access_token=...&type=recovery query params that Streamlit
+    can read server-side.  Runs silently (height=0) on every page load."""
+    st_components.html("""
+    <script>
+    (function() {
+        var hash = window.parent.location.hash;
+        if (hash && hash.indexOf('type=recovery') !== -1) {
+            var params = new URLSearchParams(hash.substring(1));
+            var at = params.get('access_token');
+            var rt = params.get('refresh_token') || '';
+            if (at) {
+                var base = window.parent.location.origin + window.parent.location.pathname;
+                window.parent.location.replace(
+                    base +
+                    '?access_token=' + encodeURIComponent(at) +
+                    '&refresh_token=' + encodeURIComponent(rt) +
+                    '&type=recovery'
+                );
+            }
+        }
+    })();
+    </script>
+    """, height=0)
+
+
+def _password_reset_screen(access_token: str, refresh_token: str):
+    """Full-page form shown when the user arrives via a Supabase password-reset
+    email link.  Uses the recovery token to authenticate, then calls
+    update_user() with the new password."""
+    st.title("VA ClaimMate — Set New Password")
+    st.markdown("---")
+    st.info("Enter and confirm your new password below.")
+
+    new_pass = st.text_input("New password (8+ characters)", type="password", key="reset_new_pass")
+    confirm_pass = st.text_input("Confirm new password", type="password", key="reset_confirm_pass")
+
+    if st.button("Update password", type="primary"):
+        if not new_pass or len(new_pass) < 8:
+            st.error("Password must be at least 8 characters.")
+            return
+        if new_pass != confirm_pass:
+            st.error("Passwords do not match.")
+            return
+        try:
+            # Build an authenticated client using the recovery session tokens.
+            reset_client = create_client(SUPABASE_URL, SUPABASE_KEY)
+            reset_client.auth.set_session(access_token, refresh_token)
+            reset_client.auth.update_user({"password": new_pass})
+            # Clear the recovery params from the URL so we don't loop.
+            st.query_params.clear()
+            st.success("Password updated! You can now log in with your new password.")
+            st.rerun()
+        except Exception as exc:
+            st.error(
+                f"Password update failed: {exc}. "
+                "The reset link may have expired — request a new one from the login screen."
+            )
+
+    st.markdown("---")
+    st.caption(
+        "VA ClaimMate is an educational tool. Not affiliated with the VA. Not legal advice."
+    )
+
+
 # ── AUTH SCREEN ────────────────────────────────────────────────────────────
 def auth_screen():
     st.title("VA ClaimMate")
@@ -1106,6 +1174,28 @@ def auth_screen():
                 st.error("Sign up failed. The email may already be registered.")
 
     st.markdown("---")
+    with st.expander("Forgot your password?"):
+        st.markdown(
+            "Enter your account email and we'll send you a password-reset link. "
+            "Check your inbox (and spam folder) — the link expires in 1 hour."
+        )
+        reset_email = st.text_input("Account email", key="reset_email")
+        if st.button("Send reset link"):
+            if not reset_email:
+                st.error("Please enter your email address.")
+            else:
+                try:
+                    supabase.auth.reset_password_for_email(
+                        reset_email,
+                        options={"redirect_to": "https://claimmate-mvp-working1.streamlit.app"},
+                    )
+                    st.success(
+                        "If that email is registered, a reset link has been sent. "
+                        "Click the link in the email to set a new password."
+                    )
+                except Exception:
+                    st.error("Couldn't send the reset email. Please try again in a moment.")
+
     with st.expander("Your privacy & how your data is protected"):
         st.markdown(
             "- Your data is stored privately and protected by database-level "
@@ -2229,7 +2319,11 @@ def app_ui():
 
 # ── ENTRY POINT ────────────────────────────────────────────────────────────
 def main():
-    if not current_user():
+    _inject_hash_extractor()
+    params = st.query_params
+    if params.get("type") == "recovery" and params.get("access_token"):
+        _password_reset_screen(params["access_token"], params.get("refresh_token", ""))
+    elif not current_user():
         auth_screen()
     else:
         app_ui()
