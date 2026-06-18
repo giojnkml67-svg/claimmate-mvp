@@ -1,6 +1,7 @@
 import os
 import io
 import json
+import base64
 from datetime import datetime
 
 import pandas as pd
@@ -23,7 +24,133 @@ from reportlab.platypus import (
 import va_rates
 import cfr_data
 
-st.set_page_config(page_title="VA ClaimMate", layout="wide")
+st.set_page_config(
+    page_title="VA ClaimMate — Stronger VA Disability Claims",
+    page_icon="🎖️",
+    layout="wide",
+    initial_sidebar_state="collapsed",
+)
+
+# ── Brand assets ───────────────────────────────────────────────────────────
+# Inline SVG logo (a navy shield with gold stars + checkmark) so it renders
+# everywhere without depending on a hosted file or asset path.
+LOGO_SVG = """
+<svg width="{w}" height="{h}" viewBox="0 0 120 132" fill="none"
+     xmlns="http://www.w3.org/2000/svg" role="img" aria-label="VA ClaimMate logo">
+  <defs>
+    <linearGradient id="shieldGrad" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#3949ab"/><stop offset="1" stop-color="#1a237e"/>
+    </linearGradient>
+    <linearGradient id="goldGrad" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#ffe082"/><stop offset="1" stop-color="#ffc107"/>
+    </linearGradient>
+  </defs>
+  <path d="M60 5 L108 21 V58 C108 89 87 113 60 127 C33 113 12 89 12 58 V21 Z"
+        fill="url(#shieldGrad)" stroke="url(#goldGrad)" stroke-width="4" stroke-linejoin="round"/>
+  <g fill="url(#goldGrad)">
+    <path d="M34 33 l2.1 4.6 5 .5 -3.8 3.4 1.1 4.9 -4.4 -2.6 -4.4 2.6 1.1 -4.9 -3.8 -3.4 5 -.5 Z"/>
+    <path d="M60 28 l2.4 5.2 5.7 .6 -4.3 3.8 1.3 5.6 -5.1 -3 -5.1 3 1.3 -5.6 -4.3 -3.8 5.7 -.6 Z"/>
+    <path d="M86 33 l2.1 4.6 5 .5 -3.8 3.4 1.1 4.9 -4.4 -2.6 -4.4 2.6 1.1 -4.9 -3.8 -3.4 5 -.5 Z"/>
+  </g>
+  <path d="M37 68 L53 85 L86 49" fill="none" stroke="url(#goldGrad)" stroke-width="11"
+        stroke-linecap="round" stroke-linejoin="round"/>
+</svg>
+"""
+
+
+def logo_html(width: int = 120) -> str:
+    """Return the logo as a base64 data-URI <img> tag scaled to `width`.
+
+    Encoding as an <img> (rather than inline <svg>) keeps it rendering
+    reliably across Streamlit versions, whose HTML sanitizer can otherwise
+    strip raw <svg> elements."""
+    svg = LOGO_SVG.format(w=width, h=int(width * 132 / 120))
+    b64 = base64.b64encode(svg.encode("utf-8")).decode("ascii")
+    return (
+        f'<img src="data:image/svg+xml;base64,{b64}" '
+        f'width="{width}" alt="VA ClaimMate logo" style="vertical-align:middle;" />'
+    )
+
+
+def inject_global_css():
+    """App-wide visual polish: typography, buttons, inputs, tabs, cards.
+    Layered on top of the native Streamlit theme in .streamlit/config.toml."""
+    st.markdown(
+        """
+        <style>
+        @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap');
+
+        html, body, [class*="css"], .stApp, [data-testid="stMarkdownContainer"] {
+            font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+        }
+
+        /* Constrain content width a touch for readability */
+        .block-container { padding-top: 2.2rem; max-width: 1180px; }
+
+        /* Headings */
+        h1, h2, h3 { color: #1a237e; font-weight: 800; letter-spacing: -0.01em; }
+        h1 { font-size: 2.3rem; }
+
+        /* Primary buttons — navy with lift on hover */
+        .stButton > button[kind="primary"],
+        .stButton > button[data-testid="baseButton-primary"] {
+            background: linear-gradient(135deg, #283593 0%, #1a237e 100%);
+            color: #fff; border: none; border-radius: 10px;
+            font-weight: 600; padding: 0.55rem 1.4rem;
+            box-shadow: 0 4px 14px rgba(26,35,126,0.30);
+            transition: transform .12s ease, box-shadow .12s ease;
+        }
+        .stButton > button[kind="primary"]:hover,
+        .stButton > button[data-testid="baseButton-primary"]:hover {
+            transform: translateY(-1px);
+            box-shadow: 0 7px 20px rgba(26,35,126,0.40);
+            color: #ffd54f;
+        }
+        /* Secondary buttons */
+        .stButton > button {
+            border-radius: 10px; font-weight: 600;
+            border: 1.5px solid #d6dbec; transition: all .12s ease;
+        }
+        .stButton > button:hover {
+            border-color: #1a237e; color: #1a237e;
+        }
+
+        /* Text inputs / textareas / selects */
+        .stTextInput input, .stTextArea textarea, .stNumberInput input,
+        div[data-baseweb="select"] > div {
+            border-radius: 10px !important;
+            border: 1.5px solid #dde1ef !important;
+        }
+        .stTextInput input:focus, .stTextArea textarea:focus {
+            border-color: #1a237e !important;
+            box-shadow: 0 0 0 3px rgba(26,35,126,0.12) !important;
+        }
+
+        /* Tabs — pill style */
+        .stTabs [data-baseweb="tab-list"] {
+            gap: 4px; flex-wrap: wrap;
+            border-bottom: 2px solid #eceff7; padding-bottom: 2px;
+        }
+        .stTabs [data-baseweb="tab"] {
+            border-radius: 9px 9px 0 0; padding: 8px 14px;
+            font-weight: 600; color: #5a6478;
+        }
+        .stTabs [aria-selected="true"] {
+            background: #eef1fb; color: #1a237e !important;
+        }
+
+        /* Expanders */
+        .streamlit-expanderHeader, details summary { font-weight: 600; }
+
+        /* Hide the default Streamlit chrome for a cleaner look */
+        #MainMenu { visibility: hidden; }
+        footer { visibility: hidden; }
+        [data-testid="stDecoration"] { display: none; }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
 
 # ── API clients ────────────────────────────────────────────────────────────
 GOOGLE_API_KEY = st.secrets.get("GOOGLE_API_KEY", "")
@@ -1102,8 +1229,17 @@ def _password_reset_screen(access_token: str, refresh_token: str):
     """Full-page form shown when the user arrives via a Supabase password-reset
     email link.  Uses the recovery token to authenticate, then calls
     update_user() with the new password."""
-    st.title("VA ClaimMate — Set New Password")
-    st.markdown("---")
+    st.markdown(
+        f"""
+        <div style="text-align:center; padding:2rem 1rem 1.6rem;
+            background: linear-gradient(135deg, #1a237e 0%, #3949ab 100%);
+            border-radius:18px; margin-bottom:1.6rem;">
+          <div>{logo_html(70)}</div>
+          <h1 style="color:#fff; margin:.3rem 0 0; font-weight:800;">Set a New Password</h1>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
     st.info("Enter and confirm your new password below.")
 
     new_pass = st.text_input("New password (8+ characters)", type="password", key="reset_new_pass")
@@ -1139,11 +1275,35 @@ def _password_reset_screen(access_token: str, refresh_token: str):
 
 # ── AUTH SCREEN ────────────────────────────────────────────────────────────
 def auth_screen():
-    st.title("VA ClaimMate")
-    st.caption("Your step-by-step companion for stronger VA disability claim preparation.")
-    st.markdown("---")
+    # ── Branded hero header ────────────────────────────────────────────────
+    st.markdown(
+        f"""
+        <div style="
+            text-align:center; padding: 2.4rem 1rem 2rem;
+            background: linear-gradient(135deg, #1a237e 0%, #283593 55%, #3949ab 100%);
+            border-radius: 18px; margin-bottom: 1.8rem;
+            box-shadow: 0 10px 30px rgba(26,35,126,0.25);">
+          <div style="margin-bottom:.4rem;">{logo_html(86)}</div>
+          <h1 style="color:#fff; margin:0; font-size:2.5rem; font-weight:800;">
+            VA&nbsp;ClaimMate
+          </h1>
+          <p style="color:#c5cae9; font-size:1.12rem; margin:.5rem 0 0; font-weight:500;">
+            Your step-by-step companion for a stronger VA disability claim.
+          </p>
+          <div style="margin-top:1.1rem; display:flex; gap:.5rem; justify-content:center; flex-wrap:wrap;">
+            <span style="background:rgba(255,213,79,.18); color:#ffd54f; padding:.32rem .85rem;
+                  border-radius:99px; font-size:.82rem; font-weight:600;">🎖️ Free for all veterans</span>
+            <span style="background:rgba(255,255,255,.12); color:#fff; padding:.32rem .85rem;
+                  border-radius:99px; font-size:.82rem; font-weight:600;">🔒 Private &amp; secure</span>
+            <span style="background:rgba(255,255,255,.12); color:#fff; padding:.32rem .85rem;
+                  border-radius:99px; font-size:.82rem; font-weight:600;">📖 38 CFR rating criteria</span>
+          </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
 
-    col1, col2 = st.columns(2)
+    col1, col2 = st.columns(2, gap="large")
     with col1:
         st.subheader("Log in")
         email = st.text_input("Email", key="login_email")
@@ -2278,13 +2438,22 @@ def app_ui():
         st.error("Could not load user data.")
         return
 
-    st.title("VA ClaimMate")
-
-    top_col1, top_col2 = st.columns([5, 1])
+    top_col1, top_col2 = st.columns([5, 1.4])
+    with top_col1:
+        st.markdown(
+            f"""
+            <div style="display:flex; align-items:center; gap:.7rem; margin-bottom:.2rem;">
+              {logo_html(46)}
+              <span style="font-size:2rem; font-weight:800; color:#1a237e;
+                    letter-spacing:-0.01em;">VA ClaimMate</span>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
     with top_col2:
         user = current_user()
         if user:
-            st.caption(f"{user.get('email', '')}")
+            st.caption(f"👤 {user.get('email', '')}")
         if st.button("Logout"):
             logout()
 
@@ -2319,6 +2488,7 @@ def app_ui():
 
 # ── ENTRY POINT ────────────────────────────────────────────────────────────
 def main():
+    inject_global_css()
     _inject_hash_extractor()
     params = st.query_params
     if params.get("type") == "recovery" and params.get("access_token"):

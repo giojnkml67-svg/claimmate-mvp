@@ -47,11 +47,20 @@ nav {
   justify-content: space-between;
 }
 .logo {
+  display: inline-flex;
+  align-items: center;
+  gap: .5rem;
   font-size: 1.2rem;
   font-weight: 700;
   color: #fff;
   text-decoration: none;
   letter-spacing: .5px;
+}
+.logo img { display: block; }
+.hero-logo {
+  display: block;
+  margin: 0 auto 1.2rem;
+  filter: drop-shadow(0 6px 14px rgba(0,0,0,.3));
 }
 .btn-nav {
   background: var(--gold);
