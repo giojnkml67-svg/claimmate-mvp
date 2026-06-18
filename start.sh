@@ -8,9 +8,11 @@ set -e
 mkdir -p .streamlit
 
 cat > .streamlit/secrets.toml << EOF
-GOOGLE_API_KEY = "${GOOGLE_API_KEY:-}"
-SUPABASE_URL   = "${SUPABASE_URL:-}"
-SUPABASE_KEY   = "${SUPABASE_KEY:-}"
+GOOGLE_API_KEY       = "${GOOGLE_API_KEY:-}"
+SUPABASE_URL         = "${SUPABASE_URL:-}"
+SUPABASE_KEY         = "${SUPABASE_KEY:-}"
+STRIPE_SECRET_KEY    = "${STRIPE_SECRET_KEY:-}"
+STRIPE_PRICE_ID      = "${STRIPE_PRICE_ID:-}"
 EOF
 
 exec streamlit run app.py \

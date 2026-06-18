@@ -168,6 +168,20 @@ if not SUPABASE_URL or not SUPABASE_KEY:
 supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 STATE_TABLE = "claimmate_state"
 
+# ── Stripe ─────────────────────────────────────────────────────────────────
+import stripe as _stripe
+
+STRIPE_SECRET_KEY = st.secrets.get("STRIPE_SECRET_KEY", "")
+STRIPE_PRICE_ID   = st.secrets.get("STRIPE_PRICE_ID", "")
+STRIPE_ENABLED    = bool(STRIPE_SECRET_KEY and STRIPE_PRICE_ID)
+if STRIPE_ENABLED:
+    _stripe.api_key = STRIPE_SECRET_KEY
+
+# Free-tier AI generation limit before upgrade prompt.
+FREE_AI_LIMIT = 3
+# App URL used as Stripe success/cancel redirect base.
+APP_URL = "https://claimmate-mvp-working1.streamlit.app"
+
 # Shown wherever AI output appears, to set expectations honestly.
 AI_DISCLAIMER = (
     "⚠️ AI-generated and may be incomplete or incorrect. Verify with a "
@@ -373,6 +387,8 @@ def default_state():
         "rating_inputs": [],
         "va_file_number": "",
         "secondary_suggestions": "",
+        "ai_uses_count": 0,
+        "stripe_customer_id": None,
     }
 
 
@@ -415,6 +431,156 @@ def delete_user_data(user_id: str) -> bool:
     except Exception:
         st.error("We couldn't delete your data right now. Please try again.")
         return False
+
+
+# ── Subscription helpers ────────────────────────────────────────────────────
+
+def _stripe_customer_id(state: dict) -> str | None:
+    return state.get("stripe_customer_id")
+
+
+def _check_stripe_subscription(customer_id: str) -> bool:
+    """Return True if the customer has an active or trialing Pro subscription."""
+    if not STRIPE_ENABLED or not customer_id:
+        return False
+    try:
+        subs = _stripe.Subscription.list(
+            customer=customer_id,
+            status="active",
+            limit=1,
+        )
+        if subs.data:
+            return True
+        # Also accept trialing
+        subs_trial = _stripe.Subscription.list(
+            customer=customer_id,
+            status="trialing",
+            limit=1,
+        )
+        return bool(subs_trial.data)
+    except Exception:
+        return False
+
+
+def is_pro(state: dict) -> bool:
+    """True if the current user has an active Pro subscription.
+
+    Result is cached in session_state for the duration of the browser session
+    so we don't hit the Stripe API on every Streamlit rerun.
+    """
+    if not STRIPE_ENABLED:
+        return False
+    if st.session_state.get("_pro_verified"):
+        return st.session_state.get("_is_pro", False)
+    customer_id = _stripe_customer_id(state)
+    result = _check_stripe_subscription(customer_id)
+    st.session_state["_is_pro"] = result
+    st.session_state["_pro_verified"] = True
+    return result
+
+
+def ai_uses_remaining(state: dict) -> int:
+    """Free AI uses left before the upgrade gate shows (0 = limit reached)."""
+    used = state.get("ai_uses_count", 0)
+    return max(0, FREE_AI_LIMIT - used)
+
+
+def increment_ai_use(state: dict) -> dict:
+    """Increment the free AI use counter and persist it."""
+    state["ai_uses_count"] = state.get("ai_uses_count", 0) + 1
+    save_state(current_user()["id"], state)
+    return state
+
+
+def create_checkout_session(email: str) -> str | None:
+    """Create a Stripe Checkout Session and return its URL.
+
+    Returns None if Stripe is not configured or the API call fails.
+    """
+    if not STRIPE_ENABLED:
+        return None
+    try:
+        session = _stripe.checkout.Session.create(
+            mode="subscription",
+            line_items=[{"price": STRIPE_PRICE_ID, "quantity": 1}],
+            customer_email=email,
+            success_url=APP_URL + "?payment=success&session_id={CHECKOUT_SESSION_ID}",
+            cancel_url=APP_URL + "?payment=cancelled",
+        )
+        return session.url
+    except Exception as exc:
+        st.error(f"Could not start checkout: {exc}")
+        return None
+
+
+def handle_payment_success(session_id: str, state: dict) -> dict:
+    """After Stripe redirects back, verify the session and store the customer ID."""
+    if not STRIPE_ENABLED:
+        return state
+    try:
+        session = _stripe.checkout.Session.retrieve(session_id)
+        if session.payment_status == "paid" or session.status == "complete":
+            state["stripe_customer_id"] = session.customer
+            save_state(current_user()["id"], state)
+            # Refresh the Pro cache.
+            st.session_state["_is_pro"] = True
+            st.session_state["_pro_verified"] = True
+    except Exception:
+        pass
+    return state
+
+
+def upgrade_gate(state: dict, feature_label: str = "this AI feature") -> bool:
+    """Show an upgrade prompt if user has no Pro sub and exhausted free uses.
+
+    Returns True if the user may proceed (Pro subscriber OR free uses remain).
+    Returns False and renders the upgrade UI if they're locked out.
+    """
+    if is_pro(state):
+        return True
+    remaining = ai_uses_remaining(state)
+    if remaining > 0:
+        st.caption(
+            f"🎖️ Free tier: **{remaining} AI use{'s' if remaining != 1 else ''} remaining**. "
+            f"[Upgrade to Pro](?upgrade=1) for unlimited access."
+        )
+        return True
+    # Locked — show upgrade wall.
+    _render_upgrade_wall(state, feature_label)
+    return False
+
+
+def _render_upgrade_wall(state: dict, feature_label: str = "this feature"):
+    user = current_user()
+    st.markdown(
+        f"""
+        <div style="
+            background: linear-gradient(135deg, #1a237e 0%, #283593 100%);
+            border-radius: 16px; padding: 2rem 2rem 1.6rem; text-align: center;
+            box-shadow: 0 8px 24px rgba(26,35,126,0.25); margin: 1rem 0;">
+          <div style="font-size:2.2rem; margin-bottom:.4rem;">🎖️</div>
+          <h2 style="color:#fff; margin:0 0 .4rem; font-size:1.6rem; font-weight:800;">
+            Upgrade to VA ClaimMate Pro
+          </h2>
+          <p style="color:#c5cae9; margin:0 0 1.2rem; font-size:1rem;">
+            You've used your {FREE_AI_LIMIT} free AI generations.
+            Upgrade for <strong style="color:#ffd54f;">unlimited AI</strong>,
+            the secondary-condition suggester, AI chat, and
+            <strong style="color:#ffd54f;">PDF export</strong>.
+          </p>
+          <p style="color:#ffd54f; font-size:1.5rem; font-weight:800; margin:0 0 1rem;">
+            $9.99 / month
+          </p>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+    if STRIPE_ENABLED and user:
+        checkout_url = create_checkout_session(user.get("email", ""))
+        if checkout_url:
+            st.link_button("🔓 Upgrade to Pro — $9.99/mo", checkout_url, type="primary")
+    else:
+        st.info("Payment processing is not yet configured. Check back soon.")
 
 
 def delete_account(user_id: str) -> bool:
@@ -1583,18 +1749,20 @@ def tab_evidence(state, tabs):
         col_a, col_b = st.columns([1, 2])
         with col_a:
             if st.button("Build or refresh summary"):
-                all_texts = [d.get("text") or "" for d in state["documents"] if d.get("text")]
-                blob = "\n\n".join(all_texts)[:15000]
-                if blob:
-                    with st.spinner("Analyzing records..."):
-                        sys = (
-                            "You summarize medical records for VA disability claims. "
-                            "Write a structured summary covering diagnoses, key findings, "
-                            "functional limitations, and any references to service or exposures."
-                        )
-                        usr = f"Summarize these records for use in a VA disability claim:\n\n{blob}"
-                        current = ask_ai(sys, usr)
-                        state["evidence_summary"] = current
+                if upgrade_gate(state, "AI evidence summary"):
+                    all_texts = [d.get("text") or "" for d in state["documents"] if d.get("text")]
+                    blob = "\n\n".join(all_texts)[:15000]
+                    if blob:
+                        with st.spinner("Analyzing records..."):
+                            sys = (
+                                "You summarize medical records for VA disability claims. "
+                                "Write a structured summary covering diagnoses, key findings, "
+                                "functional limitations, and any references to service or exposures."
+                            )
+                            usr = f"Summarize these records for use in a VA disability claim:\n\n{blob}"
+                            current = ask_ai(sys, usr)
+                            state["evidence_summary"] = current
+                            increment_ai_use(state)
                 else:
                     st.warning("No uploaded documents with extractable text yet.")
         with col_b:
@@ -1784,10 +1952,12 @@ def tab_cfr_prep(state, tabs):
                     st.markdown(f"**{cond}:**\n{sc_list}")
 
             if st.button("Ask AI: what secondary conditions am I missing?", type="primary"):
-                with st.spinner("Researching secondary conditions..."):
-                    suggestion = suggest_secondary_conditions(all_conditions)
-                if suggestion:
-                    st.session_state["secondary_suggestions"] = suggestion
+                if upgrade_gate(state, "AI secondary-conditions suggester"):
+                    with st.spinner("Researching secondary conditions..."):
+                        suggestion = suggest_secondary_conditions(all_conditions)
+                    if suggestion:
+                        st.session_state["secondary_suggestions"] = suggestion
+                        increment_ai_use(state)
 
             if st.session_state.get("secondary_suggestions"):
                 st.markdown("#### AI-identified secondary conditions")
@@ -1935,12 +2105,13 @@ def tab_statement_builder(state, tabs):
             st.session_state.latest_statement = ""
 
         if st.button("Generate personal statement", type="primary"):
-            if title.strip():
+            if not title.strip():
+                st.warning("Enter a title or focus before generating.")
+            elif upgrade_gate(state, "AI statement builder"):
                 with st.spinner("Drafting your statement..."):
                     text = build_statement(state, title, focus)
                 st.session_state.latest_statement = text
-            else:
-                st.warning("Enter a title or focus before generating.")
+                increment_ai_use(state)
 
         edited = st.text_area(
             "Statement (editable — make it sound like your own voice)",
@@ -2264,15 +2435,26 @@ def tab_saved_claims(state, tabs):
         col_pdf, col_txt = st.columns(2)
 
         with col_pdf:
-            if st.button("Generate PDF packet", type="primary"):
-                with st.spinner("Building PDF..."):
-                    try:
-                        st.session_state["pdf_packet_bytes"] = generate_pdf_packet(state)
-                    except Exception:
-                        st.session_state.pop("pdf_packet_bytes", None)
-                        st.error("Sorry, the PDF couldn't be generated. Please try again.")
+            if not is_pro(state):
+                st.markdown(
+                    "**🔒 Pro feature** — PDF export is included with VA ClaimMate Pro. "
+                    "Plain-text export is always free."
+                )
+                if STRIPE_ENABLED:
+                    user = current_user()
+                    checkout_url = create_checkout_session(user.get("email", "")) if user else None
+                    if checkout_url:
+                        st.link_button("Upgrade to Pro — $9.99/mo", checkout_url, type="primary")
+            else:
+                if st.button("Generate PDF packet", type="primary"):
+                    with st.spinner("Building PDF..."):
+                        try:
+                            st.session_state["pdf_packet_bytes"] = generate_pdf_packet(state)
+                        except Exception:
+                            st.session_state.pop("pdf_packet_bytes", None)
+                            st.error("Sorry, the PDF couldn't be generated. Please try again.")
             # Render the download button unconditionally so it survives reruns.
-            if st.session_state.get("pdf_packet_bytes"):
+            if is_pro(state) and st.session_state.get("pdf_packet_bytes"):
                 prof = state.get("veteran_profile", {})
                 name_slug = (prof.get("full_name") or "veteran").replace(" ", "_").lower()
                 date_slug = datetime.utcnow().strftime("%Y%m%d")
@@ -2314,24 +2496,28 @@ def tab_chat(state, tabs):
             with st.chat_message(msg["role"]):
                 st.write(msg["content"])
 
-        user_msg = st.chat_input("Ask a VA claim question...")
-        if user_msg:
-            st.session_state.chat_history.append({"role": "user", "content": user_msg})
+        if not is_pro(state) and ai_uses_remaining(state) == 0:
+            _render_upgrade_wall(state, "AI chat")
+        else:
+            user_msg = st.chat_input("Ask a VA claim question...")
+            if user_msg:
+                st.session_state.chat_history.append({"role": "user", "content": user_msg})
 
-            context = chat_context(state)
-            sys = (
-                "You are a VA claims education assistant. Help veterans understand VA concepts, "
-                "rating criteria, evidence requirements, and how to prepare stronger claims. "
-                "Do not provide legal advice and do not promise specific outcomes. "
-                "If relevant, mention the veteran's specific conditions or service details from context. "
-                "Suggest consulting a VSO or accredited attorney for specific claim decisions."
-            )
-            usr = f"Context for this veteran:\n{context}\n\nQuestion:\n{user_msg}"
-            reply = ask_ai(sys, usr, temp=0.35)
+                context = chat_context(state)
+                sys = (
+                    "You are a VA claims education assistant. Help veterans understand VA concepts, "
+                    "rating criteria, evidence requirements, and how to prepare stronger claims. "
+                    "Do not provide legal advice and do not promise specific outcomes. "
+                    "If relevant, mention the veteran's specific conditions or service details from context. "
+                    "Suggest consulting a VSO or accredited attorney for specific claim decisions."
+                )
+                usr = f"Context for this veteran:\n{context}\n\nQuestion:\n{user_msg}"
+                reply = ask_ai(sys, usr, temp=0.35)
+                increment_ai_use(state)
 
-            st.session_state.chat_history.append({"role": "assistant", "content": reply})
-            with st.chat_message("assistant"):
-                st.write(reply)
+                st.session_state.chat_history.append({"role": "assistant", "content": reply})
+                with st.chat_message("assistant"):
+                    st.write(reply)
 
         if st.session_state.get("chat_history"):
             if st.button("Clear chat history"):
@@ -2491,12 +2677,30 @@ def main():
     inject_global_css()
     _inject_hash_extractor()
     params = st.query_params
+
+    # Password-reset flow (Supabase recovery token in URL).
     if params.get("type") == "recovery" and params.get("access_token"):
         _password_reset_screen(params["access_token"], params.get("refresh_token", ""))
-    elif not current_user():
+        return
+
+    if not current_user():
         auth_screen()
-    else:
-        app_ui()
+        return
+
+    # Stripe payment success/cancel handling.
+    if params.get("payment") == "success" and params.get("session_id"):
+        state = get_state()
+        if state is not None:
+            handle_payment_success(params["session_id"], state)
+        st.query_params.clear()
+        st.success("🎉 Welcome to VA ClaimMate Pro! All AI features and PDF export are now unlocked.")
+        st.balloons()
+
+    elif params.get("payment") == "cancelled":
+        st.query_params.clear()
+        st.info("Upgrade cancelled — you can try again any time from the app.")
+
+    app_ui()
 
 
 if __name__ == "__main__":
